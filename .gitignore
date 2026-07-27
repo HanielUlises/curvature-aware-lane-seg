@@ -1,0 +1,67 @@
+# --- Datasets & derived data (never commit; multi-GB, reproducible via scripts) ---
+data/
+*.zip
+*.tar
+*.tar.gz
+*.tar.gz.part*
+*.partial
+
+# CurveLanes / CULane raw + intermediate artifacts
+manifest*.json
+*.lines.json.cache
+
+# --- Model artifacts ---
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+lightning_logs/
+wandb/
+mlruns/
+
+# --- Hydra / experiment outputs ---
+outputs/
+multirun/
+.hydra/
+
+# --- Visual verification dumps ---
+viz/
+*_overlay.png
+samples/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.installed.cfg
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+.python-version
+
+# --- Tooling caches ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# --- Secrets (Kaggle token etc. — never commit) ---
+kaggle.json
+.env
+
+download_data.py
