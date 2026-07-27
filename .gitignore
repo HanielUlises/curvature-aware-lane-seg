@@ -63,5 +63,3 @@ htmlcov/
 # --- Secrets (Kaggle token etc. — never commit) ---
 kaggle.json
 .env
-
-download_data.py
