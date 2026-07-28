@@ -1,0 +1,5 @@
+# Curvature-stratified subset construction.
+train_target: 8000   # ~8k flattened training subset
+val_target: 2000     # ~2k stratified validation subset (balanced eval)
+n_bins: 5
+seed: ${seed}
