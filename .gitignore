@@ -54,6 +54,11 @@ env/
 htmlcov/
 .ipynb_checkpoints/
 
+# --- C++ deploy build artifacts (deploy/ is the Python-only exception) ---
+deploy/build/
+*.o
+*.a
+
 # --- Editor / OS ---
 .vscode/
 .idea/
