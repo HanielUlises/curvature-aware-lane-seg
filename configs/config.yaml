@@ -3,15 +3,13 @@ defaults:
   - subset: default
   - model: unet_resnet18
   - train: default
+  - infer: default
   - _self_
 
 seed: 42
 
 paths:
-  # data_root resolves through the data/raw symlink to the external disk.
   data_root: data/raw/Curvelanes
-  # Prepared artifacts (manifests + cached masks) live next to the raw data,
-  # i.e. on the external disk, not the root filesystem.
   output_root: data/raw/prepared
 
 hydra:

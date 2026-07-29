@@ -3,4 +3,5 @@ encoder_name: resnet18
 encoder_weights: imagenet
 lr: 1.0e-3
 weight_decay: 1.0e-4
-dice_weight: 0.5   # loss = dice_weight * Dice + (1 - dice_weight) * BCE
+dice_weight: 0.5   # base loss = dice_weight * Dice + (1 - dice_weight) * BCE
+lovasz_weight: 0.0 # loss = (1 - lovasz_weight) * base + lovasz_weight * Lovasz-hinge

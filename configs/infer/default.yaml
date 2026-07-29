@@ -1,0 +1,19 @@
+# Qualitative inference: overlay predicted lane masks on validation frames and
+# encode a video that sweeps from straight to tight-curve (ordered by curvature).
+ckpt: null          # path to a .ckpt; null -> best checkpoint under the latest run
+n_frames: 120       # frames to render into the video
+fps: 6
+order: curvature    # curvature (straight->curvy) | random
+show_gt: true       # overlay ground-truth contour for comparison
+threshold: 0.5
+out_dir: null       # null -> <run_dir>/inference
+seed: ${seed}
+# Held-out inference (scripts.infer_images): sample valid-split frames NOT in the
+# eval manifest -> genuinely unseen by training and checkpoint selection.
+unseen_n: 250       # frames to score for the generalization metric
+unseen_video: 60    # subset of those rendered into the video
+# Sequence inference (scripts.infer_sequence): a directory of ordered frames
+# (e.g. a TuSimple clip) or a video file -> one consistent output video.
+source: null        # path to an image dir (single clip or a parent of clips) or a video
+tta: true           # horizontal-flip test-time augmentation (safe IoU boost)
+max_frames: null    # cap total frames (null = all); e.g. 300 for a ~30s montage
