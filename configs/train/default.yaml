@@ -1,0 +1,13 @@
+# Training loop (PyTorch Lightning Trainer + dataloader knobs).
+max_epochs: 50
+batch_size: 8          # the 6 GB VRAM budget at 512x288
+num_workers: 4
+precision: 16-mixed    # halves activation memory; fits the budget comfortably
+accumulate_grad_batches: 1
+gradient_clip_val: 1.0
+val_check_interval: 1.0
+log_every_n_steps: 25
+# Checkpoint selection: the tail bin is what we care about, but it can be empty
+# on tiny runs, so monitor overall val IoU by default.
+monitor: val/iou
+monitor_mode: max

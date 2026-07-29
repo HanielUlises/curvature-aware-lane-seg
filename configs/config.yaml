@@ -1,6 +1,8 @@
 defaults:
   - data: curvelanes
   - subset: default
+  - model: unet_resnet18
+  - train: default
   - _self_
 
 seed: 42

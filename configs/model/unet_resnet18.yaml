@@ -1,0 +1,6 @@
+# Baseline segmentation model: U-Net + ImageNet-pretrained ResNet-18.
+encoder_name: resnet18
+encoder_weights: imagenet
+lr: 1.0e-3
+weight_decay: 1.0e-4
+dice_weight: 0.5   # loss = dice_weight * Dice + (1 - dice_weight) * BCE
