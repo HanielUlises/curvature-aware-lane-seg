@@ -17,7 +17,11 @@ from pathlib import Path
 import hydra
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import (
+    EarlyStopping,
+    LearningRateMonitor,
+    ModelCheckpoint,
+)
 
 from src.data.datamodule import LaneDataModule
 from src.data.subset import read_manifest
@@ -58,14 +62,31 @@ def main(cfg: DictConfig) -> None:
         seed=cfg.seed,
     )
 
-    model = LaneSegmenter(
-        bin_edges=bin_edges,
-        encoder_name=cfg.model.encoder_name,
-        encoder_weights=cfg.model.encoder_weights,
-        lr=cfg.model.lr,
-        weight_decay=cfg.model.weight_decay,
-        dice_weight=cfg.model.dice_weight,
-    )
+    finetune = cfg.train.get("finetune_from", None)
+    if finetune:
+        # Load trained weights but override the loss/lr hparams and start a fresh
+        # optimizer + LR schedule (not a full resume).
+        if not Path(finetune).exists():
+            raise FileNotFoundError(f"finetune checkpoint not found: {finetune}")
+        print(f"fine-tuning from weights of {finetune}")
+        model = LaneSegmenter.load_from_checkpoint(
+            str(finetune),
+            bin_edges=bin_edges,
+            lr=cfg.model.lr,
+            weight_decay=cfg.model.weight_decay,
+            dice_weight=cfg.model.dice_weight,
+            lovasz_weight=cfg.model.get("lovasz_weight", 0.0),
+        )
+    else:
+        model = LaneSegmenter(
+            bin_edges=bin_edges,
+            encoder_name=cfg.model.encoder_name,
+            encoder_weights=cfg.model.encoder_weights,
+            lr=cfg.model.lr,
+            weight_decay=cfg.model.weight_decay,
+            dice_weight=cfg.model.dice_weight,
+            lovasz_weight=cfg.model.get("lovasz_weight", 0.0),
+        )
 
     run_dir = Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)
     checkpoint = ModelCheckpoint(
@@ -78,6 +99,16 @@ def main(cfg: DictConfig) -> None:
         auto_insert_metric_name=False,
     )
 
+    callbacks = [checkpoint, LearningRateMonitor(logging_interval="epoch")]
+    if cfg.train.patience:
+        callbacks.append(
+            EarlyStopping(
+                monitor=cfg.train.monitor,
+                mode=cfg.train.monitor_mode,
+                patience=cfg.train.patience,
+            )
+        )
+
     trainer = pl.Trainer(
         max_epochs=cfg.train.max_epochs,
         precision=cfg.train.precision,
@@ -87,12 +118,19 @@ def main(cfg: DictConfig) -> None:
         log_every_n_steps=cfg.train.log_every_n_steps,
         default_root_dir=str(run_dir),
         deterministic=True,
-        callbacks=[checkpoint, LearningRateMonitor(logging_interval="epoch")],
+        callbacks=callbacks,
     )
+
+    resume = cfg.train.resume
+    ckpt_path = str(resume) if resume else None
+    if ckpt_path and not Path(ckpt_path).exists():
+        raise FileNotFoundError(f"resume checkpoint not found: {ckpt_path}")
 
     print(OmegaConf.to_yaml(cfg))
     print(f"train frames: unknown (manifest), val frames: {len(val_entries)}")
-    trainer.fit(model, datamodule=datamodule)
+    if ckpt_path:
+        print(f"resuming from {ckpt_path}")
+    trainer.fit(model, datamodule=datamodule, ckpt_path=ckpt_path)
 
 
 if __name__ == "__main__":
