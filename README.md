@@ -6,11 +6,13 @@ kinematic Model Predictive Controller, so every design choice in this repository
 judged by its effect on the geometry the controller actually consumes: the lateral offset
 of the vehicle in its lane and the curvature of the lane ahead.
 
-![Lane predictions on unseen highway footage](docs/assets/lane_demo.gif)
+<p align="center">
+  <img src="docs/assets/lane_demo.gif" alt="Lane predictions on unseen highway footage" width="720">
+</p>
 
-*Baseline U-Net/ResNet-18 (0.616 val IoU) run frame by frame on held-out TuSimple clips,
-a different camera than the CurveLanes training data. Predicted lane mask in red. The
-prediction stays stable across frames with no temporal modelling.*
+<p align="center"><em>Baseline U-Net/ResNet-18 (0.616 val IoU) run frame by frame on held-out
+TuSimple clips, a different camera than the CurveLanes training data. Predicted lane mask
+in red. The prediction stays stable across frames with no temporal modelling.</em></p>
 
 ## Data and training
 
@@ -109,8 +111,8 @@ few pixels. A bigger backbone is not the answer.
 
 ## Qualitative behaviour
 
-The rendered overlays in `results/baseline/`, and the held-out driving montage in
-`results/tusimple_demo/`, agree with the numbers. The best frames, around 0.85 IoU, span
+The rendered validation overlays, and the held-out TuSimple driving montage, agree with
+the numbers. The best frames, around 0.85 IoU, span
 the full curvature range, and so do the worst frames. Success and failure are not sorted
 by curvature. Where the model fails it is almost always a night scene or faint markings:
 it recovers the lane location but lays down a slightly thick, broken stroke. The failure
@@ -128,11 +130,12 @@ order:
 2. **Ground-plane projection (IPM).** Apply an inverse-perspective homography from camera
    calibration to map lane points into a metric bird's-eye view. This removes the
    perspective inflation of curvature near the vanishing point, which is the known
-   limitation of image-space κ noted in `docs/geometry_port_spec.md`.
+   limitation of image-space κ set out in the
+   [geometry port specification](docs/geometry_port_spec.md).
 3. **Geometry in BEV.** Fit the arclength spline in ground coordinates and read off
-   curvature κ(s) and lateral offset. The estimator already exists in `src/geometry/`,
-   with a portable NumPy reference and a validated C++ port in `deploy/` against shared
-   golden vectors.
+   curvature κ(s) and lateral offset. The estimator already exists in the geometry module,
+   with a portable NumPy reference and a validated C++ port in the deployment module
+   against shared golden vectors.
 4. **Control-relevant evaluation.** Replace, or at least augment, IoU with the errors the
    MPC consumes: lateral offset error and curvature error at fixed preview distances. This
    makes the top-line thesis measurable, since a model can win on IoU and still misplace
@@ -142,7 +145,7 @@ order:
    independently per frame.
 6. **Kinematic MPC.** Feed lateral offset, heading error, and previewed κ into a kinematic
    bicycle MPC. Close the loop in simulation first, then port the perception-to-geometry
-   path to the C++ target in `deploy/`.
+   path to the C++ deployment target.
 
 Steps 2 and 3 are the immediate next work. Step 4 is being done in parallel, because it
 defines the metric the rest of the project optimizes against.
