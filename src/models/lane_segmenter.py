@@ -38,6 +38,7 @@ class LaneSegmenter(pl.LightningModule):
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
         dice_weight: float = 0.5,
+        lovasz_weight: float = 0.0,
     ) -> None:
         super().__init__()
         # bin_edges is data, not a hyperparameter to reconstruct the model from.
@@ -50,16 +51,25 @@ class LaneSegmenter(pl.LightningModule):
         )
         self.dice_loss = smp.losses.DiceLoss(mode="binary", from_logits=True)
         self.bce_loss = nn.BCEWithLogitsLoss()
+        # Lovász-hinge is a direct surrogate for IoU (vs Dice's soft overlap); adding
+        # it sharpens thin-structure boundaries where IoU is most sensitive.
+        self.lovasz_loss = smp.losses.LovaszLoss(mode="binary", from_logits=True)
         self.dice_weight = dice_weight
+        self.lovasz_weight = lovasz_weight
         self.val_metric = StratifiedSegMetric(bin_edges)
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         return self.net(image)
 
     def _loss(self, logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        return self.dice_weight * self.dice_loss(logits, mask) + (
+        base = self.dice_weight * self.dice_loss(logits, mask) + (
             1.0 - self.dice_weight
         ) * self.bce_loss(logits, mask)
+        if self.lovasz_weight > 0:
+            return (1.0 - self.lovasz_weight) * base + self.lovasz_weight * self.lovasz_loss(
+                logits, mask
+            )
+        return base
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         logits = self(batch["image"])
