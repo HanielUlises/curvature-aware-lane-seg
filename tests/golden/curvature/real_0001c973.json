@@ -74,7 +74,7 @@
   "percentile": 90.0,
   "num_samples": 100,
   "expected_analytic": null,
-  "python_p90": 10.522925528096224,
+  "python_p90": 15.769764227859477,
   "compare": "python",
   "tolerance": 0.02
 }

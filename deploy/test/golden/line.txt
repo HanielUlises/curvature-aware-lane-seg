@@ -2,7 +2,7 @@ name line
 percentile 90.0
 num_samples 100
 expected_analytic 0.0
-python_p90 7.669417478881251e-17
+python_p90 7.669417386965628e-17
 tolerance 0.001
 compare analytic
 points 25

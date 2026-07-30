@@ -30,7 +30,7 @@ import numpy as np
 
 from src.data.curvelanes import build_frame, index_split
 from src.data.rasterize import is_target_aspect
-from src.geometry.curvature_portable import lane_curvature_natural
+from src.geometry.curvature_portable import lane_curvature_portable
 
 _JSON_DIR = Path("tests/golden/curvature")
 _TXT_DIR = Path("deploy/test/golden")
@@ -56,7 +56,7 @@ class GoldenCase:
 
 
 def _p90(points: np.ndarray) -> float:
-    return lane_curvature_natural(points, _PERCENTILE, _NUM_SAMPLES)
+    return lane_curvature_portable(points, _PERCENTILE, _NUM_SAMPLES)
 
 
 def _analytic_cases() -> list[GoldenCase]:

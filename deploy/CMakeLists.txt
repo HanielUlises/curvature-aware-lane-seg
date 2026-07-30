@@ -17,8 +17,9 @@ if(NOT TARGET Eigen3::Eigen)
   endif()
 endif()
 
-add_library(curvature_port src/curvature.cpp)
-target_include_directories(curvature_port PUBLIC include)
+add_library(curvature_port src/spline.cpp src/curvature.cpp src/ipm.cpp
+                           src/road_geometry.cpp)
+target_include_directories(curvature_port PUBLIC include PRIVATE src)
 if(TARGET Eigen3::Eigen)
   target_link_libraries(curvature_port PUBLIC Eigen3::Eigen)
 else()
@@ -32,3 +33,9 @@ target_link_libraries(test_curvature PRIVATE curvature_port)
 target_compile_definitions(test_curvature PRIVATE
                            GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/golden")
 add_test(NAME curvature_golden COMMAND test_curvature)
+
+add_executable(test_geometry test/test_geometry.cpp)
+target_link_libraries(test_geometry PRIVATE curvature_port)
+target_compile_definitions(test_geometry PRIVATE
+                           GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/golden")
+add_test(NAME geometry_golden COMMAND test_geometry)

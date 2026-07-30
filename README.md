@@ -328,9 +328,14 @@ order:
    2 cm and holds a constant curve to under 5 cm.
 
 All six steps are implemented and unit-tested, with step 2 calibrated from TuSimple and
-cross-validated by two independent estimators. What remains is integration rather than new
-components: running the filter and controller over recorded sequences to measure closed-loop
-behaviour against real perception noise instead of the simulated plant, and porting the
-perception-to-geometry path to the C++ target. Extending the
+cross-validated by two independent estimators. Steps 2 and 3 are now ported to C++
+alongside the curvature estimator, pinned by their own golden vectors; porting them
+exposed a real defect, since the natural spline end condition the port had been using
+forces curvature to zero at the ends of a polyline and so returned 0.0032 1/m instead of
+0.02 for the 5 m preview on a 50 m arc. Not-a-knot end conditions fixed it in both
+languages. What remains is integration rather than new components: running the filter and
+controller over recorded sequences to measure closed-loop behaviour against real
+perception noise instead of the simulated plant, and porting the mask-to-centreline stage
+and the controller itself. Extending the
 metric evaluation onto TuSimple, where the units are physical, would let the control errors
 be quoted in real metres rather than as relative comparisons.

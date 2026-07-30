@@ -2,8 +2,8 @@
 //
 // C++ port of src/geometry/curvature.py. The Python reference fits a B-spline
 // with scipy/FITPACK, which has no drop-in C++ equivalent; this port uses a
-// natural parametric cubic spline instead. It is therefore validated *not* by
-// matching FITPACK internals but against the shared golden vectors: on curves
+// parametric cubic spline with not-a-knot ends instead. It is therefore validated
+// *not* by matching FITPACK internals but against the shared golden vectors: on curves
 // with a closed-form answer (line, circle) both implementations must recover the
 // true geometric curvature, and on arbitrary polylines the port must agree with
 // the Python reference within the tolerance recorded per case.
@@ -22,7 +22,7 @@ struct Point {
   double y;
 };
 
-// Sample |kappa| along a natural parametric cubic spline through points,
+// Sample |kappa| along the portable cubic spline through points,
 // parameterized by normalized arclength, at num_samples uniform locations.
 // Returns an empty vector when curvature is undefined (< 3 unique points).
 std::vector<double> CurvatureAlong(const std::vector<Point>& points, int num_samples);

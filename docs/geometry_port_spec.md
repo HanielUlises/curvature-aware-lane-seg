@@ -5,9 +5,11 @@ on-vehicle, in C++ rather than Python. This document is the **numerical contract
 C++ port of the geometry module must satisfy, so that the port is a verified
 transcription rather than a reimplementation trusted by eye.
 
-It currently specifies **curvature**, the only geometry primitive implemented so far.
-The inverse-perspective projection and the ground-plane spline fit extend the same
-contract-plus-golden-vectors pattern.
+It specifies three stages of the perception-to-control chain: **curvature**
+(sections 3 to 6), the **inverse-perspective projection** (section 7), and the metric
+**road-geometry read-out** the controller consumes (section 8). Each is held to the
+same contract-plus-golden-vectors pattern. The lane-mask decomposition that precedes
+them and the controller itself are not yet ported.
 
 ## 1. Rationale
 
@@ -20,11 +22,17 @@ numerically against shared golden vectors.
 
 ## 2. Implementations
 
-| Role | Method | Purpose |
-|---|---|---|
-| Training reference | [FITPACK smoothing spline (SciPy)](../src/geometry/curvature.py) | Curvature-stratified subset and evaluation; produced the shipped manifests. |
-| Portable reference | [Natural cubic spline, pure NumPy](../src/geometry/curvature_portable.py) | The specification the C++ mirrors. |
-| Deployment port | [Natural cubic spline, Eigen](../deploy/src/curvature.cpp) | The on-vehicle loop. |
+| Stage | Training reference | Portable reference | Deployment port |
+|---|---|---|---|
+| Curvature | [FITPACK smoothing spline](../src/geometry/curvature.py) | [Cubic spline, pure NumPy](../src/geometry/curvature_portable.py) | [Cubic spline, Eigen](../deploy/src/curvature.cpp) |
+| Projection | [DLT homography](../src/geometry/ipm.py) | same module (no library gap) | [DLT homography, Eigen](../deploy/src/ipm.cpp) |
+| Road geometry | [FITPACK-backed read-out](../src/geometry/road_geometry.py) | [Portable read-out](../src/geometry/road_geometry_portable.py) | [Eigen read-out](../deploy/src/road_geometry.cpp) |
+
+The curvature stage is the only one with a library gap. The projection is a small SVD
+with the same mathematics on both sides, so the port is held to floating-point
+agreement rather than a loose tolerance. The road-geometry stage inherits the curvature
+split: its portable reference exists so the port has something to be pinned against
+that does not call FITPACK.
 
 The portable reference and the C++ port implement identical mathematics and agree to
 floating-point precision, with relative error on the order of $10^{-16}$ on the golden
@@ -57,7 +65,7 @@ and its normalization to the unit interval:
 s_i = \sum_{k=1}^{i} \ell_{k-1}, \qquad u_i = \frac{s_i}{s_{N-1}} \in [0, 1].
 ```
 
-**3.3 Natural cubic splines.** Fit $x(u)$ and $y(u)$ independently as natural cubic
+**3.3 Cubic splines.** Fit $x(u)$ and $y(u)$ independently as interpolating cubic
 splines. For a scalar function $f$ with nodal values $f_i$ and spacings
 $h_i = u_{i+1} - u_i$, the second-derivative moments $M_i = f''(u_i)$ solve the
 tridiagonal system
@@ -68,11 +76,28 @@ h_{i-1} M_{i-1} + 2(h_{i-1} + h_i)\, M_i + h_i M_{i+1}
 \quad 1 \le i \le N-2,
 ```
 
-under the natural boundary conditions
+closed by **not-a-knot** end conditions, which require the third derivative to be
+continuous across the first and last interior knots:
 
 ```math
-M_0 = M_{N-1} = 0.
+h_1 M_0 - (h_0 + h_1) M_1 + h_0 M_2 = 0,
+\qquad
+h_{N-2} M_{N-3} - (h_{N-3} + h_{N-2}) M_{N-2} + h_{N-3} M_{N-1} = 0.
 ```
+
+Together with the $N-2$ interior equations this is a full $N \times N$ system for all
+moments, including the endpoints. With $N = 3$ there is a single interior knot and the
+not-a-knot conditions are undefined; that case falls back to $M_0 = M_{N-1} = 0$.
+
+The natural condition $M_0 = M_{N-1} = 0$ was used previously and is **not**
+acceptable here. It forces $\kappa = 0$ at the polyline ends, and the controller reads
+curvature at a $5\,\text{m}$ look-ahead which, on a centreline recovered from a
+detection, sits close to the near end. Measured on a circular arc of radius
+$50\,\text{m}$, the natural condition returned $\kappa = 0.0032\ \text{m}^{-1}$ at that
+look-ahead against a true $0.02\ \text{m}^{-1}$; not-a-knot returns
+$0.02000\ \text{m}^{-1}$ at every look-ahead. The percentile summary of section 3.5 was
+insensitive to the difference, which is why the error surfaced only once the
+road-geometry stage began reading pointwise values.
 
 On the segment $u \in [u_i, u_{i+1}]$, writing $a = u_{i+1} - u$ and $b = u - u_i$, the
 interpolant and its derivatives are
@@ -139,16 +164,18 @@ Sanity anchors: for a straight line $\kappa \equiv 0$; for a circle of radius $R
 $\kappa \equiv 1/R$; for a clothoid, $\kappa(s)$ is affine in arclength $s$.
 
 If a future port substitutes a different spline, either regenerate the expectations from
-the portable reference or retain the natural-cubic mathematics and expect the same tight
+the portable reference or retain the mathematics of section 3 and expect the same tight
 agreement.
 
 ## 5. Golden vectors
 
-The export routine writes a canonical JSON set (consumed by the Python guard) and a flat
-text set (parsed by the C++ test without a JSON dependency). Each fixture carries the
-input polyline and the expected summary. The Python side is guarded by its golden test,
-the C++ side by the deployment test suite. Regenerate the fixtures after any change to
-the curvature mathematics.
+Two export routines, one for curvature and one for the projection and road-geometry
+stages, each write a canonical JSON set (consumed by the Python guard) and a flat text
+set (parsed by the C++ tests without a JSON dependency). Each fixture carries its input
+and the expected output. The Python side is guarded by its golden tests, the C++ side by
+the two deployment test suites. Regenerate the fixtures after any change to the
+mathematics, and expect the values to move: the not-a-knot correction of section 3.3
+changed every fixture that reads pointwise curvature.
 
 ## 6. Limitations carried into deployment
 
@@ -156,6 +183,79 @@ the curvature mathematics.
   plane, where perspective inflates apparent curvature near the vanishing point. True
   road curvature requires the ground-plane projection, which will feed the port
   ground-plane points in place of image points.
-- **Natural boundary conditions** force $\kappa = 0$ at the polyline endpoints. The
-  percentile summary is robust to this, but pointwise $\kappa$ near the ends is not
-  trustworthy; trim to the interior if a port needs per-sample values.
+- **Endpoint conditioning.** Not-a-knot removes the forced $\kappa = 0$ that the
+  natural condition imposed at the polyline ends (section 3.3), but the ends remain the
+  least constrained part of the fit: they are extrapolated from one interior cubic
+  rather than bracketed by data on both sides. Pointwise $\kappa$ within a segment or
+  two of either end is accordingly the least trustworthy.
+- **Interpolation, not smoothing.** The portable spline passes exactly through every
+  input point, so detection jitter enters the curvature estimate undamped. The training
+  path applies FITPACK smoothing; the deployment path relies instead on the temporal
+  filter downstream. A port fed raw per-frame detections without that filter will see
+  curvature noise.
+
+## 7. Projection (inverse-perspective mapping)
+
+Given $N \ge 4$ correspondences $(x_i, y_i) \mapsto (u_i, v_i)$, the homography
+$H$ satisfying $[u, v, 1]^\top \sim H\,[x, y, 1]^\top$ is the Direct Linear Transform
+solution. Each correspondence contributes two rows to $A \in \mathbb{R}^{2N \times 9}$:
+
+```math
+\begin{bmatrix}
+-x_i & -y_i & -1 & 0 & 0 & 0 & u_i x_i & u_i y_i & u_i \\
+0 & 0 & 0 & -x_i & -y_i & -1 & v_i x_i & v_i y_i & v_i
+\end{bmatrix},
+```
+
+and $\mathrm{vec}(H)$ is the right singular vector of $A$ belonging to the smallest
+singular value, rescaled so $H_{33} = 1$. That rescaling also removes the sign
+ambiguity of the singular vector, so the two implementations must agree elementwise and
+not merely up to scale.
+
+Applying $H$ to a point divides out the homogeneous coordinate, with the divisor
+floored at $10^{-12}$ in magnitude so that points at the horizon, where the divisor
+passes through zero, do not produce infinities.
+
+**Tolerance.** Elementwise agreement with the reference $H$, and agreement on mapped
+points, within $10^{-9}$ relative. The round trip $H^{-1} H$ must return the probe
+points to within $10^{-6}$ pixels; this is what draws bird's-eye results back onto the
+camera frame, where an inversion error would show up only as a mis-drawn overlay.
+
+## 8. Road geometry
+
+Input: the ego centreline in ground coordinates, $x$ lateral (right positive), $z$
+ahead, sorted by increasing $z$. Output: the three quantities the kinematic lateral MPC
+consumes.
+
+**8.1 Near-field line.** Take the points within $12\,\text{m}$ of the nearest one (or
+the three nearest, if fewer than three qualify) and fit $x = m z + c$ by ordinary least
+squares. Lateral offset and heading error are read from this fit:
+
+```math
+e_y = c + m\, d, \qquad e_\psi = \arctan m,
+```
+
+where $d = 5\,\text{m}$ is the look-ahead at which offset is reported. Offset is **not**
+quoted at $z = 0$: a centreline recovered from a detection typically begins about
+$12\,\text{m}$ ahead, so a value at the vehicle plane would be extrapolated rather than
+measured. Two nearest points would define the line exactly and pass their angular noise
+straight through that extrapolation, which is why the span is fitted instead.
+
+**8.2 Curvature.** Sample signed curvature along the spline of section 3, retaining the
+sign of the cross product rather than its magnitude, and negate it: the formula returns
+counter-clockwise-positive values, and in these axes a right-hand turn is clockwise,
+whereas the controller convention is right-positive. The scalar summary is the median
+over the samples.
+
+**8.3 Preview curvature.** Curvature samples are indexed by the spline parameter, not
+by distance, so evaluate the spline itself on the identical uniform parameter grid,
+sort the pairs $(z_j, \kappa_j)$ by depth, and linearly interpolate $\kappa$ at each
+requested look-ahead. Look-aheads outside the sampled depth range yield $\mathrm{NaN}$
+rather than a clamped value: the controller must be able to tell "no curvature
+information at $20\,\text{m}$" from "straight at $20\,\text{m}$".
+
+**Tolerance.** $10^{-6}$ relative against the portable reference on all four outputs,
+with $\mathrm{NaN}$ required to match $\mathrm{NaN}$ exactly. The closed-form anchors
+are a straight lane ($e_\psi = 0$, $\kappa = 0$), a lane at constant slope
+($e_\psi = \arctan m$ exactly), and a circular arc of radius $R$ ($\kappa = \pm 1/R$ at
+every preview distance, sign following the turn direction).

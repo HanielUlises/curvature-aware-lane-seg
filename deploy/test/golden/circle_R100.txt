@@ -2,7 +2,7 @@ name circle_R100
 percentile 90.0
 num_samples 100
 expected_analytic 0.01
-python_p90 0.010009982377929574
+python_p90 0.010001888837912046
 tolerance 0.05
 compare analytic
 points 45

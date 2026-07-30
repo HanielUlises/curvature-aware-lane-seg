@@ -1,7 +1,7 @@
 """Regression guard for the curvature golden vectors.
 
 The golden vectors are the acceptance contract for the C++ deployment port
-(``deploy/``). ``python_p90`` is the **portable natural-cubic reference**
+(``deploy/``). ``python_p90`` is the **portable cubic-spline reference**
 (:mod:`src.geometry.curvature_portable`) that the C++ mirrors. Separately, the
 FITPACK training implementation (:mod:`src.geometry.curvature`) must still recover
 the analytic curvature on closed-form cases — the two agree on real geometry even
@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 
 from src.geometry.curvature import lane_curvature
-from src.geometry.curvature_portable import lane_curvature_natural
+from src.geometry.curvature_portable import lane_curvature_portable
 
 _GOLDEN_DIR = Path("tests/golden/curvature")
 
@@ -37,9 +37,9 @@ _skip = pytest.mark.skipif(
 @_skip
 @pytest.mark.parametrize("case", _CASES, ids=[c["name"] for c in _CASES])
 def test_portable_reference_matches_frozen_golden(case: dict) -> None:
-    """The portable natural-cubic reference reproduces its own frozen values."""
+    """The portable cubic-spline reference reproduces its own frozen values."""
     points = np.array(case["points"], dtype=np.float64)
-    got = lane_curvature_natural(points, case["percentile"], case["num_samples"])
+    got = lane_curvature_portable(points, case["percentile"], case["num_samples"])
     assert got == pytest.approx(case["python_p90"], rel=1e-9, abs=1e-12)
 
     if case["expected_analytic"] is not None:

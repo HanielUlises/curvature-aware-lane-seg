@@ -2,7 +2,7 @@ name real_00009c0c
 percentile 90.0
 num_samples 100
 expected_analytic nan
-python_p90 29.547245819312508
+python_p90 32.563695285374514
 tolerance 0.02
 compare python
 points 12
