@@ -179,10 +179,11 @@ axis is illumination, not geometry, which is what the flat per-bin table predict
   <img src="docs/assets/control_demo.gif" alt="Perception to control chain on TuSimple footage" width="820">
 </p>
 
-<p align="center"><em>Left: predicted lane mask (red), lane polylines recovered from it
-(cyan), and the ego centreline (yellow). Right: the same geometry after the calibrated
-ground projection, on a metric grid, with the quantities the controller consumes. Crosses
-mark the 5, 10 and 20 m preview distances. Five seconds of continuous held-out TuSimple
+<p align="center"><em>Top left: predicted lane mask (red), lane polylines recovered from it
+(cyan), and the ego centreline (yellow). Top right: the same geometry after the calibrated
+ground projection, on a metric grid, with the quantities the controller consumes; crosses
+mark the 5, 10 and 20 m preview distances. Bottom: raw per-frame estimates in grey against
+the temporally filtered signal in green. Five seconds of continuous held-out TuSimple
 footage at 20 Hz, 99 of 100 frames yielding an ego lane.</em></p>
 
 This is the whole chain in one view: mask, then polylines, then centreline, then metric
@@ -203,6 +204,22 @@ boundaries either side of the vehicle, so no centreline could be formed. Those f
 the detection failures counted in the control metric above, and seeing them here is the
 point: an overlap score would have logged the distant markings as a partial success, while
 the controller gets nothing.
+
+The trace strip is the argument for filtering at all, and it is not flattering to the raw
+signal. Over this run the raw estimate changes by 0.78 m of offset and 3.5 degrees of
+heading between consecutive frames, which are 50 ms apart. A vehicle cannot move that far
+sideways in that time, so the per-frame geometry is dominated by estimation noise rather
+than motion, and the raw curvature is worse still, flipping sign on 48 of 98 frame
+transitions, meaning it carries almost no information about which way the road actually
+bends. Filtering cuts the frame-to-frame variation by 4.6 times on offset, 3.2 times on
+heading and 37 times on curvature.
+
+The most likely source is lane association rather than mask quality. The mask also fires on
+barriers and reflective strips, so the pair of boundaries selected as the ego lane can
+change between frames, which steps the offset. Even filtered, 0.17 m of offset variation per
+frame is more than a controller should be asked to track, so the honest reading is that this
+is a working pipeline whose geometry needs a better association stage before an MPC is
+pointed at it.
 
 ## Roadmap toward the controller
 

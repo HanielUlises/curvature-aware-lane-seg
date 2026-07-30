@@ -1,11 +1,15 @@
 """Visualize the whole perception-to-control chain, frame by frame.
 
-Renders two panels side by side. The left panel is the camera view carrying the
-predicted lane mask, the extracted lane polylines and the ego centreline. The right
-panel is the metric bird's-eye view produced by the calibrated ground projection, with
-a distance grid, the projected lane boundaries and centreline, preview markers, and the
-three quantities a kinematic MPC consumes: lateral offset, heading error and signed
-curvature.
+The top row places the camera view, carrying the predicted lane mask, the extracted lane
+polylines and the ego centreline, beside the metric bird's-eye view produced by the
+calibrated ground projection, with a distance grid, preview markers and the three
+quantities a kinematic MPC consumes: lateral offset, heading error and signed curvature.
+
+Underneath, a trace strip plots the raw per-frame estimate against the temporally
+filtered signal (:mod:`src.geometry.temporal`) over a sliding window. Raw geometry is far
+noisier than a vehicle can physically move, so the strip is the clearest statement of why
+the filter exists, and it breaks the raw line at frames where no ego lane was recovered
+while the filtered line coasts through them.
 
 The bird's-eye panel is only meaningful with a real calibration, so it reads
 ``calibration.json`` and refuses to guess. Because that calibration is measured on
@@ -19,6 +23,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -32,6 +37,7 @@ from src.data.transforms import build_eval_transform
 from src.geometry.calibration import CameraCalibration, ground_plane_from_calibration
 from src.geometry.centerline import ego_lane_pair, extract_lane_polylines
 from src.geometry.road_geometry import road_geometry
+from src.geometry.temporal import RoadGeometryFilter
 from src.models.lane_segmenter import LaneSegmenter
 from scripts.infer_sequence import _center_crop_aspect, _frames_from_source, _predict
 from scripts.infer_video import _latest_run, _resolve_ckpt
@@ -40,6 +46,11 @@ from scripts.infer_video import _latest_run, _resolve_ckpt
 BEV_WIDTH = 320
 X_MAX_M = 7.0
 Z_MAX_M = 35.0
+# Trace strip under the two panels, showing raw against filtered over time.
+TRACE_HEIGHT = 96
+TRACE_WINDOW = 100
+COL_RAW = (120, 120, 132)
+COL_FILT = (90, 220, 140)
 COL_MASK = (232, 62, 62)      # prediction, red
 COL_LANE = (0, 200, 255)      # extracted boundaries, cyan
 COL_CENTER = (255, 225, 0)    # ego centreline, yellow
@@ -90,7 +101,68 @@ def _draw_ground_polyline(panel: np.ndarray, pts: np.ndarray, colour, radius=1) 
             cv2.circle(panel, _bev_point(float(x), float(z), h), radius, colour, -1)
 
 
-def _render(image_rgb, mask, polylines, centre_img, geom, ground, previews):
+def _draw_trace(panel, x0, width, raw, filt, label, unit):
+    """One sparkline of raw against filtered history inside ``panel``."""
+    h = panel.shape[0]
+    top, bottom = 18, h - 6
+    cv2.putText(panel, label, (x0 + 6, 13), cv2.FONT_HERSHEY_SIMPLEX, 0.34,
+                (170, 170, 178), 1, cv2.LINE_AA)
+
+    values = [v for v in list(raw) + list(filt) if v is not None and np.isfinite(v)]
+    if not values:
+        return
+    lo, hi = min(values), max(values)
+    if hi - lo < 1e-9:
+        lo, hi = lo - 1.0, hi + 1.0
+    pad = 0.12 * (hi - lo)
+    lo, hi = lo - pad, hi + pad
+
+    def to_px(i, v, n):
+        u = x0 + 6 + int((width - 14) * i / max(n - 1, 1))
+        y = bottom - int((bottom - top) * (v - lo) / (hi - lo))
+        return u, y
+
+    # Zero line, since the sign of offset and curvature is what matters.
+    if lo < 0.0 < hi:
+        _, yz = to_px(0, 0.0, len(filt))
+        cv2.line(panel, (x0 + 6, yz), (x0 + width - 8, yz), (58, 58, 66), 1)
+
+    for series, colour, thickness in ((raw, COL_RAW, 1), (filt, COL_FILT, 2)):
+        pts = [
+            to_px(i, v, len(series))
+            for i, v in enumerate(series)
+            if v is not None and np.isfinite(v)
+        ]
+        # Break the polyline at gaps so a missed detection reads as a gap, not a jump.
+        prev_i = None
+        for (i, v), p in zip(
+            [(i, v) for i, v in enumerate(series) if v is not None and np.isfinite(v)],
+            pts,
+        ):
+            if prev_i is not None and i - prev_i == 1:
+                cv2.line(panel, prev_p, p, colour, thickness, cv2.LINE_AA)
+            prev_i, prev_p = i, p
+
+    latest = next((v for v in reversed(filt) if v is not None and np.isfinite(v)), None)
+    if latest is not None:
+        cv2.putText(panel, f"{latest:+.3f} {unit}", (x0 + width - 92, 13),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, COL_FILT, 1, cv2.LINE_AA)
+
+
+def _draw_trace_strip(width, hist):
+    """The full trace strip: offset on the left, curvature on the right."""
+    panel = np.full((TRACE_HEIGHT, width, 3), 18, dtype=np.uint8)
+    half = width // 2
+    _draw_trace(panel, 0, half, hist["offset_raw"], hist["offset_filt"],
+                "lateral offset   raw vs filtered", "m")
+    _draw_trace(panel, half, width - half, hist["kappa_raw"], hist["kappa_filt"],
+                "curvature   raw vs filtered", "1/m")
+    cv2.line(panel, (half, 0), (half, TRACE_HEIGHT), (48, 48, 56), 1)
+    return panel
+
+
+def _render(image_rgb, mask, polylines, centre_img, geom, ground, previews,
+            filtered=None, hist=None):
     """Compose the camera panel and the bird's-eye panel into one frame."""
     h, w = image_rgb.shape[:2]
     left = image_rgb.copy()
@@ -111,8 +183,11 @@ def _render(image_rgb, mask, polylines, centre_img, geom, ground, previews):
                 (170, 170, 178), 1, cv2.LINE_AA)
 
     if geom is None:
-        cv2.putText(panel, "no ego lane", (BEV_WIDTH // 2 - 44, h // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (110, 110, 200), 1, cv2.LINE_AA)
+        note = "no ego lane"
+        if filtered is not None and filtered.coasting_frames:
+            note += f" (coasting {filtered.coasting_frames})"
+        cv2.putText(panel, note, (BEV_WIDTH // 2 - 62, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 210), 1, cv2.LINE_AA)
     else:
         pair = ego_lane_pair(polylines, w)
         if pair is not None:
@@ -125,21 +200,34 @@ def _render(image_rgb, mask, polylines, centre_img, geom, ground, previews):
                 u, v = _bev_point(0.0, float(dist), h)
                 cv2.drawMarker(panel, (u, v), (200, 200, 210), cv2.MARKER_TILTED_CROSS,
                                6, 1)
-        rows = [
-            f"offset  {geom.lateral_offset_m:+.2f} m",
-            f"heading {math.degrees(geom.heading_error_rad):+.1f} deg",
-            f"kappa   {geom.curvature_1pm:+.4f} 1/m",
-        ]
-        radius = 1.0 / abs(geom.curvature_1pm) if abs(geom.curvature_1pm) > 1e-4 else None
-        rows.append(f"radius  {radius:.0f} m" if radius and radius < 1e4 else "radius  straight")
         # Dim the strip behind the readout so it stays legible over the lane markers.
         strip = panel[h - 62 :, :]
         panel[h - 62 :, :] = (strip * 0.25).astype(np.uint8)
-        for i, text in enumerate(rows):
-            cv2.putText(panel, text, (6, h - 46 + i * 14), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.38, COL_TEXT, 1, cv2.LINE_AA)
+        cv2.putText(panel, "raw", (128, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.33,
+                    COL_RAW, 1, cv2.LINE_AA)
+        cv2.putText(panel, "filtered", (208, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.33,
+                    COL_FILT, 1, cv2.LINE_AA)
+        rows = [
+            ("offset", f"{geom.lateral_offset_m:+.2f}",
+             f"{filtered.lateral_offset_m:+.2f}" if filtered else "", "m"),
+            ("heading", f"{math.degrees(geom.heading_error_rad):+.1f}",
+             f"{math.degrees(filtered.heading_error_rad):+.1f}" if filtered else "", "deg"),
+            ("kappa", f"{geom.curvature_1pm:+.4f}",
+             f"{filtered.curvature_1pm:+.4f}" if filtered else "", "1/m"),
+        ]
+        for i, (name, raw_v, filt_v, unit) in enumerate(rows):
+            y = h - 36 + i * 12
+            cv2.putText(panel, f"{name} ({unit})", (6, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.33, COL_TEXT, 1, cv2.LINE_AA)
+            cv2.putText(panel, raw_v, (120, y), cv2.FONT_HERSHEY_SIMPLEX, 0.33,
+                        COL_RAW, 1, cv2.LINE_AA)
+            cv2.putText(panel, filt_v, (208, y), cv2.FONT_HERSHEY_SIMPLEX, 0.33,
+                        COL_FILT, 1, cv2.LINE_AA)
 
-    return np.hstack([left, panel])
+    composed = np.hstack([left, panel])
+    if hist is not None:
+        composed = np.vstack([composed, _draw_trace_strip(composed.shape[1], hist)])
+    return composed
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
@@ -170,8 +258,11 @@ def main(cfg: DictConfig) -> None:
     out_path = out_dir / f"{source.stem or 'sequence'}_control.mp4"
     writer = cv2.VideoWriter(
         str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), cfg.infer.fps,
-        (target_size[0] + BEV_WIDTH, target_size[1]),
+        (target_size[0] + BEV_WIDTH, target_size[1] + TRACE_HEIGHT),
     )
+    filt = RoadGeometryFilter(dt=1.0 / max(float(cfg.infer.fps), 1.0))
+    hist = {k: deque([None] * TRACE_WINDOW, maxlen=TRACE_WINDOW)
+            for k in ("offset_raw", "offset_filt", "kappa_raw", "kappa_filt")}
 
     max_frames = cfg.infer.get("max_frames", None)
     n = detected = 0
@@ -189,7 +280,13 @@ def main(cfg: DictConfig) -> None:
             if centre_img is not None else None
         )
         detected += geom is not None
-        frame = _render(image, pred, polylines, centre_img, geom, ground, previews)
+        smoothed = filt.update(geom)
+        hist["offset_raw"].append(geom.lateral_offset_m if geom else None)
+        hist["kappa_raw"].append(geom.curvature_1pm if geom else None)
+        hist["offset_filt"].append(smoothed.lateral_offset_m)
+        hist["kappa_filt"].append(smoothed.curvature_1pm)
+        frame = _render(image, pred, polylines, centre_img, geom, ground, previews,
+                        smoothed, hist)
         writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         n += 1
     writer.release()
