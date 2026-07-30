@@ -226,15 +226,26 @@ order:
    MPC consumes: lateral offset error and curvature error at fixed preview distances. This
    makes the top-line thesis measurable, since a model can win on IoU and still misplace
    the centerline the controller tracks. Implemented; see the control-error section above.
-5. **Temporal stability.** Track the centerline across frames (a simple state filter on the
-   spline coefficients) so the control input is smooth rather than re-estimated
-   independently per frame.
-6. **Kinematic MPC.** Feed lateral offset, heading error, and previewed κ into a kinematic
-   bicycle MPC. Close the loop in simulation first, then port the perception-to-geometry
-   path to the C++ deployment target.
+5. **Temporal stability.** A constant-velocity Kalman filter per quantity, so the command
+   is smooth rather than re-estimated independently each frame. It also answers the
+   detection-failure finding directly: a frame with no ego lane advances on the motion
+   model instead of returning nothing, and the filter reports how long it has been
+   coasting so a supervisor can hand over before the extrapolation is trusted too far.
+   Measurements far outside the predicted distribution are gated out, which stops one
+   badly placed centreline from stepping the steering.
+6. **Kinematic MPC.** Linearized lateral error dynamics of a kinematic bicycle, with
+   previewed curvature entering as a known disturbance so a curve is handled by
+   feedforward rather than by letting error build. Stacking the horizon makes the solve a
+   closed-form least-squares problem, re-solved every step, with the steering limit applied
+   by saturation; a genuinely constrained solve would need a QP, which this is not. In
+   steady state on a constant-curvature path it reproduces the Ackermann relation
+   `delta = L * kappa`, and in closed-loop simulation it drives a 1.5 m offset to under
+   2 cm and holds a constant curve to under 5 cm.
 
-Steps 1 to 4 are implemented and unit-tested, and step 2 now has a calibrated projection
-whose parameters are measured from TuSimple, cross-validated by two independent estimators.
-The remaining work is temporal filtering and then the controller itself. Extending the
+All six steps are implemented and unit-tested, with step 2 calibrated from TuSimple and
+cross-validated by two independent estimators. What remains is integration rather than new
+components: running the filter and controller over recorded sequences to measure closed-loop
+behaviour against real perception noise instead of the simulated plant, and porting the
+perception-to-geometry path to the C++ target. Extending the
 metric evaluation onto TuSimple, where the units are physical, would let the control errors
 be quoted in real metres rather than as relative comparisons.
