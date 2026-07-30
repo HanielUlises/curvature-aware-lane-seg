@@ -234,6 +234,37 @@ by curvature. Where the model fails it is almost always a night scene or faint m
 it recovers the lane location but lays down a slightly thick, broken stroke. The failure
 axis is illumination, not geometry, which is what the flat per-bin table predicts.
 
+## Control chain
+
+<p align="center">
+  <img src="docs/assets/control_demo.gif" alt="Perception to control chain on TuSimple footage" width="820">
+</p>
+
+<p align="center"><em>Left: predicted lane mask (red), lane polylines recovered from it
+(cyan), and the ego centreline (yellow). Right: the same geometry after the calibrated
+ground projection, on a metric grid, with the quantities the controller consumes. Crosses
+mark the 5, 10 and 20 m preview distances. Held-out TuSimple footage, 222 of 240 frames
+yielding an ego lane.</em></p>
+
+This is the whole chain in one view: mask, then polylines, then centreline, then metric
+ground geometry, then the three control inputs. It also serves as a visual check on the
+calibration, because the lane boundaries come back close to vertical and evenly spaced in
+the bird's-eye panel. Perspective makes them converge sharply in the camera view, so
+recovering them as parallel is the property a correct inverse-perspective map has to
+satisfy, and it is the same property the fit was scored on.
+
+The readout is the interface to the controller. Lateral offset is signed positive to the
+right of the camera axis, heading is the centreline bearing from straight ahead, and
+curvature is signed so a right turn is positive, quoted alongside the radius it implies. On
+this stretch the values sit around 0.2 m of offset, a couple of degrees of heading, and
+radii in the hundreds of metres, which is what a highway lane should give.
+
+Where the panel reads "no ego lane" the mask carried distant lane markings but not the two
+boundaries either side of the vehicle, so no centreline could be formed. Those frames are
+the detection failures counted in the control metric above, and seeing them here is the
+point: an overlap score would have logged the distant markings as a partial success, while
+the controller gets nothing.
+
 ## Roadmap toward the controller
 
 The segmenter produces a lane mask in the image plane. The controller needs lateral
