@@ -147,6 +147,40 @@ def curvature_along(
     return np.asarray(numerator / denom, dtype=np.float64)
 
 
+def signed_curvature_along(
+    points: FloatArray,
+    num_samples: int = DEFAULT_NUM_SAMPLES,
+    smoothing: float = DEFAULT_SMOOTHING,
+) -> FloatArray:
+    """Sample **signed** curvature ``kappa(u)`` uniformly along a polyline.
+
+    Identical to :func:`curvature_along` but retains the sign of the cross product,
+    following the standard convention: positive is a counter-clockwise turn in the
+    coordinate frame the points are given in. A controller needs the sign to tell a
+    left turn from a right one; the stratification and golden-vector contract use the
+    unsigned magnitude and are unaffected by this function.
+
+    Args:
+        points: Polyline of shape ``(N, 2)``.
+        num_samples: Number of evaluation points along the curve.
+        smoothing: Spline smoothing ``s`` (see :func:`fit_arclength_spline`).
+
+    Returns:
+        Array of signed curvatures. Empty if curvature is undefined.
+    """
+    tck = fit_arclength_spline(points, smoothing)
+    if tck is None:
+        return np.zeros(0, dtype=np.float64)
+
+    u = np.linspace(0.0, 1.0, num_samples)
+    dx, dy = splev(u, tck, der=1)
+    ddx, ddy = splev(u, tck, der=2)
+    numerator = dx * ddy - dy * ddx
+    speed_sq = dx * dx + dy * dy
+    denom = np.power(np.maximum(speed_sq, _SPEED_EPS), 1.5)
+    return np.asarray(numerator / denom, dtype=np.float64)
+
+
 def lane_curvature(
     points: FloatArray,
     percentile: float = DEFAULT_PERCENTILE,

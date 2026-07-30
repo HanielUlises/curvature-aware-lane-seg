@@ -16,6 +16,7 @@ from src.geometry.curvature import (
     curvature_along,
     frame_curvature,
     lane_curvature,
+    signed_curvature_along,
 )
 
 
@@ -131,3 +132,22 @@ def test_frame_curvature_takes_max_over_lanes() -> None:
     assert frame_curvature(frame, smoothing=0.0) == pytest.approx(
         lane_curvature(curved / 1000.0, smoothing=0.0), rel=1e-9
     )
+
+
+def test_signed_curvature_matches_magnitude_and_carries_sign() -> None:
+    R = 50.0
+    theta = np.linspace(0.0, 1.0, 60)
+    # Counter-clockwise arc: standard convention gives a positive signed curvature.
+    ccw = np.stack([R * np.cos(theta), R * np.sin(theta)], axis=1)
+    signed = signed_curvature_along(ccw, smoothing=0.0)
+    unsigned = curvature_along(ccw, smoothing=0.0)
+    assert np.all(signed > 0)
+    np.testing.assert_allclose(np.abs(signed), unsigned, rtol=1e-9)
+    # Reversing the traversal flips the sign but not the magnitude.
+    flipped = signed_curvature_along(ccw[::-1], smoothing=0.0)
+    assert np.all(flipped < 0)
+    np.testing.assert_allclose(np.abs(flipped), unsigned[::-1], rtol=1e-6)
+
+
+def test_signed_curvature_undefined_returns_empty() -> None:
+    assert signed_curvature_along(np.array([[0.0, 0.0], [1.0, 1.0]])).size == 0
