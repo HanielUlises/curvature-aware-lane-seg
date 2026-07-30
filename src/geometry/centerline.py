@@ -77,6 +77,29 @@ def _x_at_bottom(poly: FloatArray) -> float:
     return float(poly[np.argmax(poly[:, 1]), 0])
 
 
+def ego_lane_pair(
+    polylines: list[FloatArray], image_width: int
+) -> tuple[FloatArray, FloatArray] | None:
+    """The two lanes bracketing the camera axis, nearest first on each side.
+
+    Args:
+        polylines: Lane polylines from :func:`extract_lane_polylines`.
+        image_width: Frame width in pixels; its half is the ego reference column.
+
+    Returns:
+        ``(left_lane, right_lane)``, or ``None`` if the ego column is not bracketed.
+    """
+    if len(polylines) < 2:
+        return None
+    center_x = image_width / 2.0
+    left = [p for p in polylines if _x_at_bottom(p) < center_x]
+    right = [p for p in polylines if _x_at_bottom(p) >= center_x]
+    if not left or not right:
+        return None
+    # Nearest lane on each side of the ego column.
+    return max(left, key=_x_at_bottom), min(right, key=_x_at_bottom)
+
+
 def ego_centerline(
     polylines: list[FloatArray],
     image_width: int,
@@ -84,10 +107,9 @@ def ego_centerline(
 ) -> FloatArray | None:
     """Centerline of the ego lane: midpoint of the two lanes bracketing the view.
 
-    Picks the lane whose nearest point lies just left of image center and the one
-    just right of it, then averages their columns over the row range they share.
-    The averaging is done on a uniform grid of rows so the two lanes, sampled at
-    different rows, still combine cleanly.
+    Averages the columns of the bracketing lane pair over the row range they share,
+    on a uniform grid of rows so the two lanes, sampled at different rows, still
+    combine cleanly.
 
     Args:
         polylines: Lane polylines from :func:`extract_lane_polylines`.
@@ -98,17 +120,10 @@ def ego_centerline(
         An ``(num_points, 2)`` centerline ordered top-to-bottom, or ``None`` if no
         left/right pair brackets the ego column.
     """
-    if len(polylines) < 2:
+    pair = ego_lane_pair(polylines, image_width)
+    if pair is None:
         return None
-    center_x = image_width / 2.0
-
-    left = [p for p in polylines if _x_at_bottom(p) < center_x]
-    right = [p for p in polylines if _x_at_bottom(p) >= center_x]
-    if not left or not right:
-        return None
-    # Nearest lane on each side of the ego column.
-    left_lane = max(left, key=_x_at_bottom)
-    right_lane = min(right, key=_x_at_bottom)
+    left_lane, right_lane = pair
 
     y0 = max(left_lane[:, 1].min(), right_lane[:, 1].min())
     y1 = min(left_lane[:, 1].max(), right_lane[:, 1].max())
