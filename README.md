@@ -1,10 +1,9 @@
-# Curvature-Aware Lane Segmentation for Downstream Control
+# Curvature-Aware Lane Segmentation
 
-Lane perception from monocular RGB, optimized against **downstream control error on
-high-curvature trajectories** rather than raw segmentation overlap. The end consumer is a
-kinematic Model Predictive Controller, so every design choice in this repository is
-judged by its effect on the geometry the controller actually consumes: the lateral offset
-of the vehicle in its lane and the curvature of the lane ahead.
+Monocular lane perception evaluated on the geometry a controller consumes, rather than on
+segmentation overlap. The intended consumer is a kinematic Model Predictive Controller,
+which needs the vehicle's lateral offset in its lane and the curvature of the lane ahead,
+so those are the quantities measured here.
 
 <p align="center">
   <img src="docs/assets/lane_demo.gif" alt="Lane predictions on unseen highway footage" width="720">
@@ -41,7 +40,7 @@ cosine schedule, batch size 8, mixed precision. Preprocessing applies an aspect-
 sky crop followed by an isotropic resize, so the resize does not distort curvature and the
 stratification label stays valid. Validation runs on a separately stratified 2,000-frame
 set. On a 6 GB RTX 3060 an epoch takes about 2.5 minutes and uses 2.4 GB, well under the
-memory budget. That headroom matters for the capacity experiment below.
+memory budget.
 
 Validation IoU (Figure 2) climbs quickly and plateaus around epoch 40. The best
 checkpoint is epoch 48 at 0.616. The early kink is a resume after a power interruption,
@@ -87,28 +86,6 @@ because the sample follows the natural distribution, where such frames are rare.
 is itself the reason stratified training was necessary, even when stratified evaluation
 cannot populate every bin.
 
-## What does not improve it
-
-We tried the obvious levers for a stronger baseline. None beat 0.616, and the pattern of
-failure is the useful result.
-
-Sweeping the decision threshold from 0.30 to 0.80 leaves IoU flat, with a peak at exactly
-0.50. The probability maps are already well calibrated, so thresholding gives nothing.
-Doubling encoder capacity to ResNet-34, with a larger batch and a Dice-weighted loss,
-plateaus at 0.611, just below ResNet-18. Capacity is not the constraint, which matches
-the memory headroom above. A Lovász-hinge term, which is a direct IoU surrogate,
-destabilizes training from scratch and mildly degrades the model as a low-weight
-fine-tune. The one change that helps is horizontal-flip test-time augmentation, which
-lifts validation IoU to 0.623. Lanes are left/right symmetric, so the averaged prediction
-is slightly cleaner at no training cost.
-
-The model is at the practical ceiling for this supervision. The binding constraint is the
-thin-stroke geometry: a one-pixel error on a five-pixel mask is a large relative IoU
-penalty, and neither extra capacity nor loss engineering changes that. Moving past about
-0.62 requires changing what the network predicts, for example thicker or distance-weighted
-supervision, or a bird's-eye-view projection so that far lanes are not compressed into a
-few pixels. A bigger backbone is not the answer.
-
 ## Control-relevant error, and why IoU was misleading
 
 Overlap is not the quantity the controller consumes. To measure what is, the mask is
@@ -147,51 +124,26 @@ markings could pair the wrong two lanes, and extrapolating the centreline to the
 plane is poorly conditioned. Both are measurement artifacts rather than model behaviour,
 so nothing is claimed from that column.
 
-The practical conclusion is that the segmentation ceiling discussed above was the wrong
-thing to optimise. Detection reliability on curves, not another point of IoU, is what
-limits this model as a control front end.
+The practical conclusion is that another point of IoU was the wrong thing to chase.
+Detection reliability on curves is what limits this model as a control front end.
 
 ## Metric calibration, and what the numbers can support
 
-The mapping used above asserts that a hand-chosen image trapezoid is a rectangle on flat
-ground. That is a stable mapping but not a camera, so it was worth replacing with a real
-pinhole model: the ground plane relates to the image by `H = K R M` for rotation `R` and
-`M = [[1,0,0],[0,0,h],[0,1,0]]`, which is exact for flat ground. That model is
-implemented and verified against synthetic scenes, where it recovers a known pitch to
-within 0.05 degrees, returns parallel 3.7 m lanes as parallel and 3.7 m apart to 1e-6,
-and recovers the curvature of a projected arc of radius 80 m to 1e-4.
+The table above uses a hand-chosen trapezoid asserted to be a rectangle on flat ground.
+That is stable but it is not a camera, so it was replaced with a pinhole model, where the
+ground plane maps to the image by `H = K R M` with `M = [[1,0,0],[0,0,h],[0,1,0]]`. On
+synthetic scenes the model recovers a known pitch to 0.05 degrees and a projected arc of
+radius 80 m to 1e-4.
 
-Fitting its parameters to CurveLanes does not work, and the reasons are worth recording
-because they bound what the control metric can claim, and because they point to the
-dataset that does work.
+Its parameters cannot be fitted to CurveLanes. The vanishing point is unusable because the
+annotations stop around row 146 while the horizon sits near row 82, leaving a long
+extrapolation that scatters by about 68 pixels. Fitting pitch by lane parallelism instead
+also fails to identify anything: no interior optimum, 63 percent of frames pegged at the
+search bound, and no pitch admitting a plausible camera height. The cause is that
+CurveLanes aggregates many vehicles and cameras, so no single calibration exists.
 
-The textbook route is the vanishing point, which fixes pitch and yaw directly. It is
-unusable here: the lane annotations stop around row 146 of the 288-row preprocessed
-frame while the horizon sits near row 82, so the vanishing point is a long extrapolation
-beyond the data and its per-frame estimate scatters with an interquartile range of about
-68 pixels. (Fixing a real bug along the way: the intrinsics must be carried through the
-sky crop, since cropping the top moves the principal point up to row 82 rather than the
-frame centre at 144.)
-
-The alternative is to fit pitch by making the ego lanes parallel on the ground, which
-depends only on the near-field lanes that are observed. Measured as perpendicular
-distance rather than lateral difference at equal depth, since the latter overestimates
-width on exactly the curves this dataset over-samples, that objective still fails to
-identify a calibration. It has no interior optimum, rising monotonically from the search
-bound; 63 percent of frames peg their individual optimum at that bound; per-frame optima
-disagree across roughly 8 degrees; and no pitch admits a physically plausible camera,
-with the implied height 2.37 m at zero pitch against an expected 1.2 to 1.6 m. Matching a
-plausible height would need a field of view near 100 degrees, where lens distortion
-invalidates an undistorted pinhole model anyway.
-
-The explanation is that CurveLanes aggregates footage from many vehicles and cameras, so
-there is no single calibration to recover. That is a property of the dataset rather than a
-missing implementation, and it suggests the remedy: calibrate on a source filmed by one
-vehicle.
-
-TuSimple is that source. It comes from a single fleet, and it annotates lanes at fixed
-rows from 240 to 710 of the native 1280 by 720 frame, which spans the horizon region
-instead of stopping short of it. Every diagnostic that failed on CurveLanes now passes:
+TuSimple does have one, being a single fleet with lanes annotated across the horizon
+region. Every failed diagnostic passes there:
 
 | | CurveLanes | TuSimple |
 |---|---|---|
@@ -201,29 +153,16 @@ instead of stopping short of it. Every diagnostic that failed on CurveLanes now 
 | recovered lane width | 3.43 m, IQR 2.60 to 4.70 | **3.64 m, IQR 3.56 to 3.80** |
 | implied camera height | 2.37 m at zero pitch | **1.62 m** |
 
-The fitted camera is 7.47 degrees of pitch, 1.00 degree of yaw, and 1.62 m of height. The
-strongest evidence that this is a real measurement rather than a fitted artifact is that
-two independent estimators agree: lane parallelism gives 7.47 degrees and the vanishing
-point, which the fit never uses, gives 7.71 degrees, a difference of 0.24 degrees. The
-recovered lane width lands within 0.5 percent of the 3.7 m standard with an interquartile
-range of 0.24 m, against 2.1 m on CurveLanes. The 1.62 m height is higher than a
-passenger car, which is consistent with TuSimple being autonomous-trucking footage.
+The fitted camera is 7.47 degrees of pitch, 1.00 degree of yaw and 1.62 m of height. Two
+independent estimators agree on it: parallelism gives 7.47 degrees, and the vanishing
+point, which the fit never uses, gives 7.71 degrees. The height suits TuSimple being
+trucking footage.
 
-The calibration is fitted in native pixels and converted into preprocessed-frame pixels,
-since cropping and scaling change the intrinsic matrix but do not move the camera. One
-caveat is worth stating plainly: this describes TuSimple's camera, so it makes the
-TuSimple driving demo metric, and it does **not** retroactively put the CurveLanes
-control-error table into physical units. Those remain relative comparisons, and
-`scripts.eval_control` warns if a calibration is used across datasets.
-
-What this means for the results above is settled empirically rather than by argument.
-Re-running the evaluation under the pinhole mapping instead of the trapezoid leaves the
-detection rates **bit-for-bit identical** (83.5, 77.1, 76.8, 68.9, 59.3 percent by bin)
-while error magnitudes shift by a factor of three to four. Detection rate involves no
-metric geometry at all, so the headline finding, that lane detection degrades
-monotonically with curvature, does not depend on calibration. The heading and curvature
-orderings are preserved across both mappings. The absolute error magnitudes are not, and
-should be read only as relative comparisons.
+Two caveats. This is TuSimple's camera, so it makes the driving demo metric but leaves the
+CurveLanes error magnitudes as relative comparisons; `scripts.eval_control` warns on
+cross-dataset use. And re-running the evaluation under the pinhole mapping leaves detection
+rates **bit-for-bit identical** while error magnitudes shift three to four fold, so the
+headline finding does not depend on calibration but the absolute magnitudes do.
 
 ## Qualitative behaviour
 
@@ -243,8 +182,8 @@ axis is illumination, not geometry, which is what the flat per-bin table predict
 <p align="center"><em>Left: predicted lane mask (red), lane polylines recovered from it
 (cyan), and the ego centreline (yellow). Right: the same geometry after the calibrated
 ground projection, on a metric grid, with the quantities the controller consumes. Crosses
-mark the 5, 10 and 20 m preview distances. Held-out TuSimple footage, 222 of 240 frames
-yielding an ego lane.</em></p>
+mark the 5, 10 and 20 m preview distances. Five seconds of continuous held-out TuSimple
+footage at 20 Hz, 99 of 100 frames yielding an ego lane.</em></p>
 
 This is the whole chain in one view: mask, then polylines, then centreline, then metric
 ground geometry, then the three control inputs. It also serves as a visual check on the
