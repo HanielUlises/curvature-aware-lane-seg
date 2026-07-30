@@ -4,9 +4,16 @@ defaults:
   - model: unet_resnet18
   - train: default
   - infer: default
+  - ipm: default
   - _self_
 
 seed: 42
+
+# Cap the number of frames scored by scripts.eval_control (null = the whole split).
+eval_limit: null
+
+# Frames used by scripts.calibrate_camera to estimate the camera calibration.
+calib_frames: 500
 
 paths:
   data_root: data/raw/Curvelanes

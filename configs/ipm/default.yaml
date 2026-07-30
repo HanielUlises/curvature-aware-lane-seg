@@ -1,0 +1,60 @@
+# Image to flat-ground-plane mapping.
+#
+# mode: calibrated | trapezoid
+#   trapezoid   assert that four hand-chosen image points on the road form a rectangle on
+#               flat ground. The metric scale is arbitrary but the mapping is stable, and
+#               it is what the reported control-error numbers were measured with.
+#   calibrated  a proper pinhole camera model (see src.geometry.calibration). Exact when
+#               the camera is known, and validated as such on synthetic data, but its
+#               parameters are NOT recoverable from CurveLanes; see scripts.calibrate_camera
+#               and the README. Use this mode once real intrinsics and extrinsics exist.
+#
+# Neither mode gives trustworthy absolute metres on CurveLanes. That does not affect the
+# reported conclusions: detection rate is calibration independent, and the error
+# comparisons across curvature bins apply the same mapping to prediction and ground truth.
+mode: trapezoid
+
+calibrated:
+  hfov_deg: 70.0         # assumed horizontal field of view; not observable from one view
+
+  # Pitch is an explicit ASSUMPTION, not a fit. scripts.calibrate_camera shows it is not
+  # identifiable from CurveLanes: the lane-parallelism objective has no interior optimum,
+  # 63% of frames peg their optimum at the search bound, and per-frame optima disagree
+  # (p10-p90 spanning about 8 degrees). The cause is that CurveLanes aggregates footage
+  # from many vehicles and cameras, so no single calibration exists to be found. A nominal
+  # forward-facing dashcam pitch is used instead, and the control metric's absolute units
+  # are therefore provisional; cross-bin and cross-model comparisons remain valid because
+  # the same mapping is applied to the prediction and to the ground truth.
+  pitch_deg: 6.0
+  fit_pitch: false       # set true to attempt the fit anyway and print the diagnostics
+  fit_yaw: true          # yaw from zero median lane bearing is better behaved than pitch
+
+  # Which dataset scripts.calibrate_camera measures the geometry from.
+  #   tusimple    RECOMMENDED. One vehicle fleet, one camera, and lanes annotated up to
+  #               the horizon region, so the calibration is identifiable: the parallelism
+  #               fit has a clear interior optimum and independently agrees with the
+  #               vanishing point to about 0.3 degrees. Fitted in native 1280x720 pixels
+  #               and converted to preprocessed-frame pixels for use in the pipeline.
+  #   curvelanes  Not identifiable; kept so the failure is reproducible.
+  source: tusimple
+  tusimple_label_dir: data/raw/tusimple/TUSimple/train_set
+  tusimple_source_size: [1280, 720]
+  fit_pitch_bounds_deg: [5.0, 20.0]
+
+  height_m: 1.35         # initial camera height, rescaled below
+  refine_height: true    # rescale height so the observed lane width matches the standard
+  lane_width_m: 3.7      # standard highway lane width
+
+trapezoid:
+  # Fractions of (width, height) of the preprocessed frame, ordered top-left,
+  # top-right, bottom-right, bottom-left of the road region.
+  src_trapezoid:
+    - [0.43, 0.58]
+    - [0.57, 0.58]
+    - [0.98, 1.00]
+    - [0.02, 1.00]
+  lane_width_m: 3.7      # the trapezoid base spans one lane width
+  look_ahead_m: 30.0     # the trapezoid top sits this far ahead
+
+# Look-ahead distances at which curvature is reported to the controller.
+preview_distances_m: [5.0, 10.0, 20.0]
