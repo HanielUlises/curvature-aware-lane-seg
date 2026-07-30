@@ -1,5 +1,7 @@
 # --- Datasets & derived data (never commit; multi-GB, reproducible via scripts) ---
-data/
+# Leading slash anchors this to the repo root. Without it the pattern also matched
+# src/data/, which silently excluded the entire data-pipeline package from git.
+/data/
 *.zip
 *.tar
 *.tar.gz
