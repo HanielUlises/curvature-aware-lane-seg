@@ -1,4 +1,4 @@
-# Curvature-Aware Lane Segmentation
+# Curvature-Aware Lane Segmentation for Control
 
 Monocular lane perception evaluated on the geometry a controller consumes, rather than on
 segmentation overlap. The intended consumer is a kinematic Model Predictive Controller,

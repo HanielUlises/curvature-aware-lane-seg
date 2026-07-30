@@ -151,7 +151,7 @@ def _draw_trace(panel, x0, width, raw, filt, label, unit):
 
 def _draw_trace_strip(width, hist):
     """The full trace strip: offset on the left, curvature on the right."""
-    panel = np.full((TRACE_HEIGHT, width, 3), 18, dtype=np.uint8)
+    panel = np.full((TRACE_HEIGHT, width, 3), 32, dtype=np.uint8)
     half = width // 2
     _draw_trace(panel, 0, half, hist["offset_raw"], hist["offset_filt"],
                 "lateral offset   raw vs filtered", "m")
@@ -177,7 +177,7 @@ def _render(image_rgb, mask, polylines, centre_img, geom, ground, previews,
         for x, y in centre_img.astype(int):
             cv2.circle(left, (x, y), 2, COL_CENTER, -1)
 
-    panel = np.full((h, BEV_WIDTH, 3), 22, dtype=np.uint8)
+    panel = np.full((h, BEV_WIDTH, 3), 38, dtype=np.uint8)
     _draw_bev_grid(panel)
     cv2.putText(panel, "bird's-eye (metric)", (6, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
                 (170, 170, 178), 1, cv2.LINE_AA)
@@ -227,6 +227,10 @@ def _render(image_rgb, mask, polylines, centre_img, geom, ground, previews,
     composed = np.hstack([left, panel])
     if hist is not None:
         composed = np.vstack([composed, _draw_trace_strip(composed.shape[1], hist)])
+    # A border keeps the frame's extent readable when the page behind it is also dark,
+    # which otherwise makes the dark panels look like the image is cropped.
+    cv2.rectangle(composed, (0, 0), (composed.shape[1] - 1, composed.shape[0] - 1),
+                  (110, 110, 120), 1)
     return composed
 
 
