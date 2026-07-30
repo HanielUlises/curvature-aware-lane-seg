@@ -174,8 +174,27 @@ def _render(image_rgb, mask, polylines, centre_img, geom, ground, previews,
         for x, y in poly.astype(int):
             cv2.circle(left, (x, y), 1, COL_LANE, -1)
     if centre_img is not None:
-        for x, y in centre_img.astype(int):
-            cv2.circle(left, (x, y), 2, COL_CENTER, -1)
+        # Fade the near end. How far the centreline reaches depends on where the mask
+        # happens to detect boundaries, which varies frame to frame, so a hard endpoint
+        # draws the eye to an extent that carries no information. The positions drawn
+        # are unchanged; only their opacity near the end is.
+        pts = centre_img.astype(int)
+        n_pts = len(pts)
+        fade_from = int(n_pts * 0.65)
+        for i, (x, y) in enumerate(pts):
+            if not (0 <= x < w and 0 <= y < h):
+                continue
+            alpha = 1.0
+            if i >= fade_from and n_pts > fade_from:
+                alpha = 1.0 - (i - fade_from) / max(n_pts - fade_from, 1)
+                alpha = max(alpha, 0.0) ** 0.8
+            if alpha <= 0.02:
+                continue
+            patch = left[max(y - 2, 0):y + 3, max(x - 2, 0):x + 3].astype(np.float32)
+            blend = np.array(COL_CENTER, dtype=np.float32)
+            left[max(y - 2, 0):y + 3, max(x - 2, 0):x + 3] = (
+                (1 - alpha) * patch + alpha * blend
+            ).astype(np.uint8)
 
     panel = np.full((h, BEV_WIDTH, 3), 38, dtype=np.uint8)
     _draw_bev_grid(panel)

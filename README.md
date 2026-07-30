@@ -178,12 +178,25 @@ headline finding does not depend on calibration but the absolute magnitudes do.
 
 ## Qualitative behaviour
 
-The rendered validation overlays, and the held-out TuSimple driving montage, agree with
-the numbers. The best frames, around 0.85 IoU, span
-the full curvature range, and so do the worst frames. Success and failure are not sorted
-by curvature. Where the model fails it is almost always a night scene or faint markings:
-it recovers the lane location but lays down a slightly thick, broken stroke. The failure
-axis is illumination, not geometry, which is what the flat per-bin table predicts.
+<p align="center">
+  <img src="docs/assets/validation_sweep.gif" alt="Validation frames ordered from straight to tight curve" width="620">
+</p>
+
+<p align="center"><em>Validation frames ordered by curvature, near-straight first and
+tightest last. Red is the prediction, green the ground-truth contour, and the caption gives
+each frame's curvature, bin and IoU. Unlike the demos above this is CurveLanes with labels,
+so prediction and truth can be compared directly.</em></p>
+
+The overlays agree with the numbers. The best frames, around 0.85 IoU, span the full
+curvature range, and so do the worst frames. Success and failure are not sorted by
+curvature. Where the model fails it is almost always a night scene or faint markings: it
+recovers the lane location but lays down a slightly thick, broken stroke. The failure axis
+is illumination, not geometry, which is what the flat per-bin table predicts.
+
+Watching the sweep also shows what the per-bin IoU could not. The prediction stays glued to
+the ground truth across the whole curvature range, which is exactly why IoU looked flat,
+while the frames where the model picks up a barrier or a kerb alongside the real markings
+are the ones that later cost an ego-lane detection.
 
 ## Control chain
 
@@ -216,6 +229,22 @@ boundaries either side of the vehicle, so no centreline could be formed. Those f
 the detection failures counted in the control metric above, and seeing them here is the
 point: an overlap score would have logged the distant markings as a partial success, while
 the controller gets nothing.
+
+<p align="center">
+  <img src="docs/assets/control_montage.gif" alt="The same pipeline across many different scenes" width="700">
+</p>
+
+<p align="center"><em>The same pipeline over 240 frames drawn from many separate clips,
+227 of them yielding an ego lane. TuSimple clips are one second each and mostly minutes
+apart, so the hard cuts are clip boundaries rather than tracking failures. Where the
+continuous run above shows how the estimate behaves in time, this shows how it holds up
+across scenes.</em></p>
+
+Two things are easier to see here than in a single stretch of road. The lane count changes
+constantly as the mask picks up barriers, kerbs and reflective strips alongside the real
+markings, which is the association weakness that costs detections. And the readout stays in
+a plausible band across scenes it has never seen, which is the case for the calibration
+generalizing beyond the frames it was fitted on.
 
 The trace strip is the argument for filtering at all, and it is not flattering to the raw
 signal. Frames here are 50 ms apart, so any large change between neighbours is noise rather
