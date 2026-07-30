@@ -1,0 +1,19 @@
+# CurveLanes dataset layout and rasterization/curvature parameters.
+train_subdir: train
+valid_subdir: valid
+images_subdir: images
+labels_subdir: labels
+
+# Model input resolution (16:9). Odd-aspect frames are excluded, not distorted.
+target_size: [512, 288]
+stroke_px: 5
+aspect_tol: 0.02
+sky_frac: 0.30
+
+curvature:
+  percentile: 90.0
+  num_samples: 100
+  smoothing: 1.0e-4
+
+# Process-pool size for curvature computation and mask precompute.
+num_workers: 8
