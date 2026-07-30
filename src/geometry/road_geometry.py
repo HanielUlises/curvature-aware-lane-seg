@@ -35,6 +35,12 @@ FloatArray = np.ndarray
 
 # Look-ahead distances (metres) at which curvature is reported to the controller.
 DEFAULT_PREVIEW_M = (5.0, 10.0, 20.0)
+# Depth span over which the near-field line is fitted for offset and heading.
+NEAR_FIT_SPAN_M = 12.0
+# Distance ahead at which lateral offset is reported. Nothing is observed at the vehicle
+# plane itself: the recovered centreline typically starts about 12 m ahead, so a value
+# quoted at z = 0 is extrapolated rather than measured.
+DEFAULT_OFFSET_DISTANCE_M = 5.0
 
 
 @dataclass(frozen=True)
@@ -43,10 +49,11 @@ class RoadGeometry:
 
     Attributes:
         ground_centerline: ``(M, 2)`` centreline ``(x, z)`` in metres, near to far.
-        lateral_offset_m: Lane-centre lateral position at the vehicle (``z = 0``);
+        lateral_offset_m: Lane-centre lateral position at ``offset_distance_m`` ahead;
             positive means the centre lies to the right of the vehicle axis.
-        heading_error_rad: Angle of the centreline tangent from ``+z`` at the near
-            end; positive turns to the right.
+        offset_distance_m: Distance ahead at which the offset was evaluated.
+        heading_error_rad: Angle of the centreline tangent from ``+z``, from the
+            near-field fit; positive turns to the right.
         curvature_1pm: Representative signed curvature ahead, in ``1/m``; positive
             curves right.
         preview_distances_m: Look-ahead distances for ``preview_curvature_1pm``.
@@ -56,19 +63,40 @@ class RoadGeometry:
 
     ground_centerline: FloatArray
     lateral_offset_m: float
+    offset_distance_m: float
     heading_error_rad: float
     curvature_1pm: float
     preview_distances_m: FloatArray
     preview_curvature_1pm: FloatArray
 
 
-def _extrapolate_x_at_z0(ground: FloatArray) -> float:
-    """Lateral position of the centreline at ``z = 0`` (linear extrapolation)."""
-    (x0, z0), (x1, z1) = ground[0], ground[1]
-    if abs(z1 - z0) < 1e-9:
-        return float(x0)
-    t = (0.0 - z0) / (z1 - z0)
-    return float(x0 + t * (x1 - x0))
+def fit_near_line(
+    ground: FloatArray, span_m: float = NEAR_FIT_SPAN_M
+) -> tuple[float, float] | None:
+    """Least-squares line ``x = slope * z + intercept`` over the near centreline.
+
+    Offset and heading are both read from this fit rather than from the two nearest
+    points. Two points define a line exactly, so any angular noise in them is passed
+    straight through, and because the centreline usually begins about 12 m ahead that
+    noise is then extrapolated back over a long lever arm. Fitting the near span
+    averages it down instead.
+
+    Args:
+        ground: ``(N, 2)`` centreline ``(x, z)`` sorted by increasing ``z``.
+        span_m: Depth span from the nearest point to include in the fit.
+
+    Returns:
+        ``(intercept, slope)``, or ``None`` if fewer than two usable points remain.
+    """
+    if ground.shape[0] < 2:
+        return None
+    near = ground[ground[:, 1] <= ground[0, 1] + span_m]
+    if near.shape[0] < 3:
+        near = ground[: min(3, ground.shape[0])]
+    if near.shape[0] < 2 or np.ptp(near[:, 1]) < 1e-9:
+        return None
+    slope, intercept = np.polyfit(near[:, 1], near[:, 0], 1)
+    return float(intercept), float(slope)
 
 
 def road_geometry(
@@ -77,6 +105,7 @@ def road_geometry(
     preview_distances_m: tuple[float, ...] = DEFAULT_PREVIEW_M,
     num_samples: int = DEFAULT_NUM_SAMPLES,
     smoothing: float = DEFAULT_SMOOTHING,
+    offset_distance_m: float = DEFAULT_OFFSET_DISTANCE_M,
 ) -> RoadGeometry | None:
     """Metric road geometry from an image-space ego centreline.
 
@@ -87,6 +116,7 @@ def road_geometry(
         preview_distances_m: Look-ahead distances at which to report curvature.
         num_samples: Samples along the ground curve for the curvature estimate.
         smoothing: Spline smoothing passed to the curvature estimator.
+        offset_distance_m: Distance ahead at which to report lateral offset.
 
     Returns:
         A :class:`RoadGeometry`, or ``None`` if the centreline has fewer than three
@@ -98,10 +128,12 @@ def road_geometry(
     # Order near (small z) to far (large z).
     ground = ground[np.argsort(ground[:, 1])]
 
-    lateral_offset = _extrapolate_x_at_z0(ground)
-
-    (x0, z0), (x1, z1) = ground[0], ground[1]
-    heading = float(np.arctan2(x1 - x0, z1 - z0))
+    fit = fit_near_line(ground)
+    if fit is None:
+        return None
+    intercept, slope = fit
+    lateral_offset = intercept + slope * offset_distance_m
+    heading = float(np.arctan(slope))
 
     # Negate the counter-clockwise convention so that right turns are positive.
     kappa = -signed_curvature_along(ground, num_samples=num_samples, smoothing=smoothing)
@@ -112,6 +144,7 @@ def road_geometry(
         return RoadGeometry(
             ground_centerline=ground,
             lateral_offset_m=lateral_offset,
+            offset_distance_m=float(offset_distance_m),
             heading_error_rad=heading,
             curvature_1pm=0.0,
             preview_distances_m=previews,
@@ -134,6 +167,7 @@ def road_geometry(
     return RoadGeometry(
         ground_centerline=ground,
         lateral_offset_m=lateral_offset,
+        offset_distance_m=float(offset_distance_m),
         heading_error_rad=heading,
         curvature_1pm=representative,
         preview_distances_m=previews,
@@ -147,6 +181,7 @@ def road_geometry_from_mask(
     preview_distances_m: tuple[float, ...] = DEFAULT_PREVIEW_M,
     num_samples: int = DEFAULT_NUM_SAMPLES,
     smoothing: float = DEFAULT_SMOOTHING,
+    offset_distance_m: float = DEFAULT_OFFSET_DISTANCE_M,
 ) -> RoadGeometry | None:
     """Metric road geometry straight from a lane mask.
 
@@ -161,9 +196,10 @@ def road_geometry_from_mask(
         smoothing: Spline smoothing for the curvature estimate.
     """
     polylines = extract_lane_polylines(mask)
-    center = ego_centerline(polylines, mask.shape[1])
+    center = ego_centerline(polylines, mask.shape[1], image_height=mask.shape[0])
     if center is None:
         return None
     return road_geometry(
-        center, ground_plane, preview_distances_m, num_samples, smoothing
+        center, ground_plane, preview_distances_m, num_samples, smoothing,
+        offset_distance_m,
     )

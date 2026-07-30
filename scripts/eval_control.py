@@ -33,7 +33,10 @@ from src.geometry.calibration import (
     intrinsics_for_preprocessed_frame,
 )
 from src.geometry.ipm import build_ground_homography
-from src.geometry.road_geometry import road_geometry_from_mask
+from src.geometry.road_geometry import (
+    DEFAULT_OFFSET_DISTANCE_M,
+    road_geometry_from_mask,
+)
 from src.models.lane_segmenter import LaneSegmenter
 from scripts.infer_video import _latest_run, _resolve_ckpt
 
@@ -174,7 +177,8 @@ def main(cfg: DictConfig) -> None:
           f"{_fmt(overall.detection_rate * 100, '.1f'):>6} "
           f"{_fmt(overall.offset_mae_m):>9} {_fmt(overall.heading_mae_deg, '.2f'):>9}  "
           f"{kappa_cols}")
-    print("\noffset = m (MAE), heading = deg (MAE), k@Nm = signed curvature MAE in 1/m")
+    print(f"\noffset = m (MAE) at {DEFAULT_OFFSET_DISTANCE_M:g} m ahead, heading = deg (MAE), "
+          "k@Nm = signed curvature MAE in 1/m")
     print("Metric units depend on the placeholder IPM calibration; relative "
           "comparisons across bins and models are the meaningful readings.")
 

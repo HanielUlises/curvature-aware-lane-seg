@@ -6,7 +6,11 @@ import cv2
 import numpy as np
 
 from src.geometry.ipm import GroundPlane, build_ground_homography
-from src.geometry.road_geometry import road_geometry, road_geometry_from_mask
+from src.geometry.road_geometry import (
+    fit_near_line,
+    road_geometry,
+    road_geometry_from_mask,
+)
 
 # Identity mapping: the supplied points are already in (x, z) ground metres.
 IDENTITY = GroundPlane(h=np.eye(3), h_inv=np.eye(3))
@@ -38,7 +42,10 @@ def test_heading_error_sign_and_value():
     assert rg is not None
     assert rg.heading_error_rad > 0
     assert abs(rg.heading_error_rad - np.arctan(0.1)) < 1e-6
-    assert abs(rg.lateral_offset_m) < 1e-6  # passes through origin at z=0
+    # Offset is reported at a look-ahead, not at the vehicle plane: the lane passes
+    # through the origin but is 0.1 * 5 m to the right at the default 5 m.
+    assert abs(rg.lateral_offset_m - 0.5) < 1e-6
+    assert rg.offset_distance_m == 5.0
     assert rg.curvature_1pm < 1e-3
 
 
@@ -108,3 +115,36 @@ def test_from_mask_returns_none_without_ego_lane():
         (w, h), src_trapezoid=((0.42, 0.55), (0.58, 0.55), (0.95, 1.0), (0.05, 1.0))
     )
     assert road_geometry_from_mask(mask, gp) is None
+
+
+def test_near_line_fit_beats_two_point_extrapolation_under_noise():
+    # The defect this replaced: two points define a line exactly, so their noise passes
+    # straight through and is then extrapolated over the gap back to the vehicle. The
+    # fit must be markedly steadier frame to frame on a noisy but straight lane.
+    rng = np.random.default_rng(0)
+    offsets_fit, offsets_two_point = [], []
+    for _ in range(200):
+        z = np.linspace(12.0, 30.0, 20)  # centreline starts well ahead, as in practice
+        x = np.zeros_like(z) + rng.normal(0.0, 0.05, size=z.size)
+        ground = np.column_stack([x, z])
+        intercept, slope = fit_near_line(ground)
+        offsets_fit.append(intercept + slope * 5.0)
+        # The previous estimator: extrapolate the two nearest points back to z = 0.
+        (x0, z0), (x1, z1) = ground[0], ground[1]
+        offsets_two_point.append(x0 + (0.0 - z0) / (z1 - z0) * (x1 - x0))
+
+    jitter_fit = np.mean(np.abs(np.diff(offsets_fit)))
+    jitter_two_point = np.mean(np.abs(np.diff(offsets_two_point)))
+    assert jitter_fit < jitter_two_point / 5
+
+
+def test_near_line_fit_declines_degenerate_input():
+    assert fit_near_line(np.array([[0.0, 1.0]])) is None          # single point
+    assert fit_near_line(np.zeros((5, 2))) is None                # no depth spread
+
+
+def test_offset_distance_is_configurable():
+    rg = road_geometry(_line(lambda z: 0.2 * z), IDENTITY, offset_distance_m=10.0)
+    assert rg is not None
+    assert rg.offset_distance_m == 10.0
+    assert abs(rg.lateral_offset_m - 2.0) < 1e-6  # 0.2 * 10 m

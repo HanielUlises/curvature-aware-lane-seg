@@ -7,6 +7,7 @@ import numpy as np
 
 from src.geometry.centerline import (
     ego_centerline,
+    resample_boundary,
     extract_lane_polylines,
     image_lateral_offset,
 )
@@ -91,3 +92,44 @@ def test_lateral_offset_sign():
 def test_empty_mask_yields_nothing():
     assert extract_lane_polylines(_blank()) == []
     assert ego_centerline([], 512) is None
+
+
+def test_resample_boundary_interpolates_and_extends_within_bound():
+    poly = np.column_stack([np.linspace(100.0, 140.0, 5), np.linspace(100.0, 180.0, 5)])
+    rows = np.array([100.0, 140.0, 180.0, 200.0, 400.0])
+    out = resample_boundary(poly, rows, max_extend_rows=45)
+    # Inside the observed span it interpolates the drawn columns.
+    assert abs(out[0] - 100.0) < 1e-6 and abs(out[2] - 140.0) < 1e-6
+    # Just past the end it continues along the fitted direction.
+    assert abs(out[3] - 150.0) < 1.0
+    # Far past the end it declines rather than inventing geometry.
+    assert np.isnan(out[4])
+
+
+def test_resample_boundary_declines_degenerate_input():
+    assert np.all(np.isnan(resample_boundary(np.array([[1.0, 2.0]]), np.array([2.0]))))
+
+
+def test_centerline_extent_survives_one_short_boundary():
+    # The defect this fixed: taking only the rows both boundaries share let a single
+    # short boundary truncate the centreline, and the truncation moved frame to frame.
+    w, h = 512, 288
+    long_mask = np.zeros((h, w), np.uint8)
+    cv2.line(long_mask, (220, 40), (220, 280), 255, 4)
+    cv2.line(long_mask, (300, 40), (300, 280), 255, 4)
+    short_mask = np.zeros((h, w), np.uint8)
+    cv2.line(short_mask, (220, 40), (220, 280), 255, 4)
+    cv2.line(short_mask, (300, 40), (300, 150), 255, 4)  # right boundary stops early
+
+    polys = extract_lane_polylines(short_mask)
+    full = ego_centerline(extract_lane_polylines(long_mask), w, image_height=h)
+    short = ego_centerline(polys, w, image_height=h)
+    assert full is not None and short is not None
+
+    # Where the old shared-range rule would have stopped: the nearer end of the shorter
+    # boundary. The centreline must now reach past it by the permitted extension.
+    shared_bottom = min(p[:, 1].max() for p in polys)
+    extension = short[:, 1].max() - shared_bottom
+    assert 35 < extension <= 45 + 1  # extended, but only by the bounded amount
+    # It must still sit between the two boundaries.
+    assert abs(short[:, 0].mean() - 260) < 12

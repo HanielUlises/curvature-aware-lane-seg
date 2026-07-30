@@ -12,6 +12,7 @@ def _geom(offset=0.0, heading=0.0, curvature=0.0):
     return RoadGeometry(
         ground_centerline=np.zeros((5, 2)),
         lateral_offset_m=offset,
+        offset_distance_m=5.0,
         heading_error_rad=heading,
         curvature_1pm=curvature,
         preview_distances_m=np.array([5.0, 10.0, 20.0]),

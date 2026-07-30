@@ -70,3 +70,5 @@ deploy/build/
 # --- Secrets (Kaggle token etc. — never commit) ---
 kaggle.json
 .env
+# Lossless frame dumps from scripts.viz_control (build artifact for GIF creation)
+results/**/frames/

@@ -77,6 +77,61 @@ def _x_at_bottom(poly: FloatArray) -> float:
     return float(poly[np.argmax(poly[:, 1]), 0])
 
 
+# How far a boundary may be extended past its observed extent, in image rows. Lane
+# boundaries are locally straight, so a bounded extension is a fair reconstruction; an
+# unbounded one would invent geometry.
+DEFAULT_MAX_EXTEND_ROWS = 45
+# Rows at the end of a boundary used to fit the direction it is extended along.
+DEFAULT_FIT_TAIL_ROWS = 25
+
+
+def resample_boundary(
+    poly: FloatArray,
+    rows: FloatArray,
+    max_extend_rows: int = DEFAULT_MAX_EXTEND_ROWS,
+    fit_tail_rows: int = DEFAULT_FIT_TAIL_ROWS,
+) -> FloatArray:
+    """Sample a boundary at the given image rows, extending a bounded amount.
+
+    Inside the boundary's observed row span this interpolates. Beyond either end it
+    continues along a line fitted to that end's last ``fit_tail_rows``, for at most
+    ``max_extend_rows``; rows past that are ``nan``.
+
+    This exists because the ego centreline is otherwise defined only over the row range
+    the two boundaries happen to share, so one short boundary truncates it. The
+    truncation moves frame to frame, which makes the centreline's near end jump in depth
+    and reads as the whole line swinging.
+
+    Args:
+        poly: ``(N, 2)`` boundary as ``(x, y)``, ordered by increasing row.
+        rows: Image rows to sample at.
+        max_extend_rows: Maximum rows to continue past the observed span.
+        fit_tail_rows: Rows at each end used to fit the extension direction.
+
+    Returns:
+        Sampled columns, one per requested row, ``nan`` where unavailable.
+    """
+    poly = np.asarray(poly, dtype=np.float64)
+    rows = np.asarray(rows, dtype=np.float64)
+    if poly.shape[0] < 2:
+        return np.full(rows.shape, np.nan)
+
+    y, x = poly[:, 1], poly[:, 0]
+    y_lo, y_hi = float(y.min()), float(y.max())
+    out = np.interp(rows, y, x, left=np.nan, right=np.nan)
+
+    def extend(mask: np.ndarray, tail: np.ndarray, anchor: float) -> None:
+        if not np.any(mask) or tail.shape[0] < 2 or np.ptp(tail[:, 1]) < 1e-9:
+            return
+        slope, intercept = np.polyfit(tail[:, 1], tail[:, 0], 1)
+        within = mask & (np.abs(rows - anchor) <= max_extend_rows)
+        out[within] = slope * rows[within] + intercept
+
+    extend(rows < y_lo, poly[y <= y_lo + fit_tail_rows], y_lo)   # further away
+    extend(rows > y_hi, poly[y >= y_hi - fit_tail_rows], y_hi)   # nearer the vehicle
+    return out
+
+
 def ego_lane_pair(
     polylines: list[FloatArray], image_width: int
 ) -> tuple[FloatArray, FloatArray] | None:
@@ -104,37 +159,52 @@ def ego_centerline(
     polylines: list[FloatArray],
     image_width: int,
     num_points: int = 50,
+    image_height: int | None = None,
+    max_extend_rows: int = DEFAULT_MAX_EXTEND_ROWS,
 ) -> FloatArray | None:
     """Centerline of the ego lane: midpoint of the two lanes bracketing the view.
 
-    Averages the columns of the bracketing lane pair over the row range they share,
-    on a uniform grid of rows so the two lanes, sampled at different rows, still
-    combine cleanly.
+    Both boundaries are resampled onto one row grid that runs from the further of their
+    two far ends down towards the vehicle, each extended by at most
+    ``max_extend_rows`` past what it actually covers. Taking only the rows the two
+    boundaries share, as an earlier version did, let a single short boundary truncate
+    the centreline, and because that truncation moved from frame to frame the
+    centreline's near end jumped in depth by metres between neighbouring frames.
 
     Args:
         polylines: Lane polylines from :func:`extract_lane_polylines`.
         image_width: Frame width in pixels; its half is the ego reference column.
-        num_points: Number of points to sample along the shared row range.
+        num_points: Number of points to sample along the row range.
+        image_height: Frame height, used as the nearest row to reach towards. Defaults
+            to just below the lower boundary extent when not given.
+        max_extend_rows: Bound on how far each boundary may be extended.
 
     Returns:
         An ``(num_points, 2)`` centerline ordered top-to-bottom, or ``None`` if no
-        left/right pair brackets the ego column.
+        left/right pair brackets the ego column or too little overlap survives.
     """
     pair = ego_lane_pair(polylines, image_width)
     if pair is None:
         return None
     left_lane, right_lane = pair
 
-    y0 = max(left_lane[:, 1].min(), right_lane[:, 1].min())
-    y1 = min(left_lane[:, 1].max(), right_lane[:, 1].max())
-    if y1 <= y0:
+    top = max(left_lane[:, 1].min(), right_lane[:, 1].min())
+    observed_bottom = min(left_lane[:, 1].max(), right_lane[:, 1].max())
+    # Reach towards the vehicle by the permitted extension, capped at the frame edge.
+    target_bottom = observed_bottom + max_extend_rows
+    if image_height is not None:
+        target_bottom = min(target_bottom, float(image_height - 1))
+    if target_bottom <= top:
         return None
 
-    ys = np.linspace(y0, y1, num_points)
-    # np.interp needs increasing x; the polylines are ordered by y already.
-    xl = np.interp(ys, left_lane[:, 1], left_lane[:, 0])
-    xr = np.interp(ys, right_lane[:, 1], right_lane[:, 0])
-    return np.column_stack([(xl + xr) / 2.0, ys])
+    rows = np.linspace(top, target_bottom, num_points)
+    xl = resample_boundary(left_lane, rows, max_extend_rows)
+    xr = resample_boundary(right_lane, rows, max_extend_rows)
+    centre = (xl + xr) / 2.0
+    valid = np.isfinite(centre)
+    if valid.sum() < 3:
+        return None
+    return np.column_stack([centre[valid], rows[valid]])
 
 
 def image_lateral_offset(centerline: FloatArray, image_width: int) -> float:

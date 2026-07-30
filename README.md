@@ -95,34 +95,46 @@ control units. Reported below over the full validation split (1,767 frames, of w
 1,280 yielded a reference geometry and a prediction), stratified by the same curvature
 bins.
 
-| bin | detection rate | lateral offset MAE | heading MAE | κ MAE at 5 m | at 10 m | at 20 m |
+Offset is reported 5 m ahead rather than at the vehicle, because nothing is observed at
+the vehicle plane: the recovered centreline typically begins about 12 m out, so a figure
+quoted at the bumper is extrapolated rather than measured. Offset and heading both come
+from a least-squares line fitted over the near 12 m.
+
+| bin | detection rate | offset MAE at 5 m | heading MAE | κ MAE at 5 m | at 10 m | at 20 m |
 |---|---|---|---|---|---|---|
-| near-straight | 80.1% | 1.384 | 5.05° | 0.235 | 0.088 | 0.040 |
-| gentle | 74.6% | 0.882 | 4.18° | 0.168 | 0.095 | 0.042 |
-| moderate | 70.8% | 0.679 | 4.97° | 0.362 | 0.108 | 0.028 |
-| sharp | 67.9% | 0.677 | 8.25° | 0.380 | 0.100 | 0.033 |
-| tightest | 59.6% | 0.482 | 7.41° | 0.535 | 0.098 | 0.034 |
-| **overall** | **72.4%** | **0.895** | **5.63°** | **0.297** | **0.097** | **0.037** |
+| near-straight | 82.1% | 1.507 | 4.04° | 0.186 | 0.066 | 0.034 |
+| gentle | 75.3% | 1.065 | 3.32° | 0.181 | 0.101 | 0.034 |
+| moderate | 71.5% | 0.667 | 3.45° | 0.320 | 0.103 | 0.024 |
+| sharp | 68.9% | 0.716 | 4.07° | 0.351 | 0.101 | 0.038 |
+| tightest | 60.5% | 0.429 | 3.86° | 0.544 | 0.088 | 0.029 |
+| **overall** | **73.5%** | **0.976** | **3.72°** | **0.268** | **0.091** | **0.032** |
 
 Offsets are in metres and curvatures in 1/m under the placeholder ground-plane mapping,
 so the absolute scale is provisional; the comparison across bins is the meaningful
 reading, and the next section establishes which of these columns survive that caveat.
 
 Two of these columns reverse the conclusion drawn from IoU. **Detection rate falls
-monotonically with curvature**, from 80% on near-straight frames to 60% on the tightest
+monotonically with curvature**, from 82% on near-straight frames to 61% on the tightest
 ones: on the curves this project exists for, the model fails to yield a usable ego lane
-two times in five. **Heading error and near-field curvature error also degrade**, the
-latter from 0.235 to 0.535 across the same range, a factor of 2.3. None of this is
-visible in the per-bin IoU table, where the curved bins scored slightly *better* than
-the straight ones. The reason is that IoU counts pixels, and the pixels are dominated by
-the wide, unambiguous lane markings near the bumper, whereas the controller depends on
-the geometry further ahead and on the lane being found at all.
+two times in five. **Near-field curvature error degrades** over the same range, from 0.186
+to 0.544, a factor of 2.9. Neither is visible in the per-bin IoU table, where the curved
+bins scored slightly *better* than the straight ones. The reason is that IoU counts pixels,
+and the pixels are dominated by the wide, unambiguous lane markings near the bumper,
+whereas the controller depends on the geometry further ahead and on the lane being found
+at all.
 
-One column moves the other way and remains unexplained: lateral offset error *improves*
-with curvature, from 1.38 m to 0.48 m. Ambiguous ego-lane selection on wide, near-parallel
-markings could pair the wrong two lanes, and extrapolating the centreline to the vehicle
-plane is poorly conditioned. Both are measurement artifacts rather than model behaviour,
-so nothing is claimed from that column.
+Heading error does **not** support that conclusion, and an earlier version of this table
+claimed it did. Reading offset and heading from two points instead of a fitted line put
+heading MAE at 8.25° in the sharp bin against 5.05° near-straight, which looked like
+curvature-dependent degradation. Two points define a line exactly, so their noise passes
+through undamped. Fitting the near span drops overall heading error from 5.63° to 3.72° and
+flattens it across bins to between 3.32° and 4.07°, leaving no curvature trend. The
+apparent trend was an estimator artifact.
+
+One column remains unexplained: offset error *improves* with curvature, from 1.51 m to
+0.43 m. It survives both the estimator fix and both ground mappings, so it is not either of
+those. Ambiguous ego-lane selection on wide, near-parallel markings pairing the wrong two
+boundaries is the remaining candidate. Nothing is claimed from that column.
 
 The practical conclusion is that another point of IoU was the wrong thing to chase.
 Detection reliability on curves is what limits this model as a control front end.
@@ -206,20 +218,47 @@ point: an overlap score would have logged the distant markings as a partial succ
 the controller gets nothing.
 
 The trace strip is the argument for filtering at all, and it is not flattering to the raw
-signal. Over this run the raw estimate changes by 0.78 m of offset and 3.5 degrees of
-heading between consecutive frames, which are 50 ms apart. A vehicle cannot move that far
-sideways in that time, so the per-frame geometry is dominated by estimation noise rather
-than motion, and the raw curvature is worse still, flipping sign on 48 of 98 frame
-transitions, meaning it carries almost no information about which way the road actually
-bends. Filtering cuts the frame-to-frame variation by 4.6 times on offset, 3.2 times on
-heading and 37 times on curvature.
+signal. Frames here are 50 ms apart, so any large change between neighbours is noise rather
+than motion; a vehicle cannot move half a metre sideways in that time.
 
-The most likely source is lane association rather than mask quality. The mask also fires on
-barriers and reflective strips, so the pair of boundaries selected as the ego lane can
-change between frames, which steps the offset. Even filtered, 0.17 m of offset variation per
-frame is more than a controller should be asked to track, so the honest reading is that this
-is a working pipeline whose geometry needs a better association stage before an MPC is
-pointed at it.
+Chasing that noise found two real defects, and the first two explanations were both wrong,
+which is worth recording. The visible symptom was the centreline sliding sideways and
+snapping back.
+
+The first suspect was lane association, the ego pair switching between boundaries. The data
+did not support it: offset changed by the same amount whether or not the selected boundaries
+had switched. The actual cause was the **estimator**. Offset and heading were read from the
+two nearest centreline points, and since the centreline began a median of 12.6 m ahead, that
+noise was extrapolated back over a long lever arm. A least-squares fit over the near 12 m
+replaced it, and that is also what corrected the false heading trend above.
+
+The second suspect was lateral movement of the drawn line, and that was wrong too. At a
+fixed depth the line is steady to about 0.9 px per frame. What moved was its **near end**,
+which jumped a median of 8.9 m in depth per frame, because the centreline was defined only
+over the rows the two boundaries happened to share and one short boundary truncated it.
+Resampling both boundaries onto a common row grid, each extended by at most 45 rows past
+what it covers, cut that to 2.25 m and brought the near end from 17.5 m to 8.1 m.
+
+| | original | after fit | after fit and extent | filtered |
+|---|---|---|---|---|
+| offset jitter | 0.779 m | 0.427 m | 0.366 m | **0.120 m** |
+| heading jitter | 3.48° | 1.63° | 1.27° | **0.46°** |
+| near-end depth wander | 8.9 m | 8.9 m | **2.25 m** | n/a |
+
+One thing that was tried and rejected: drawing the centreline reconstructed from the
+filtered state rather than the raw one. Measured at 10 m ahead it was 7.7 times *less*
+steady than the raw line, because rebuilding a curve from three filtered scalars amplifies
+heading and curvature noise quadratically with distance. Reverted.
+
+Curvature is untouched by either fix, since it comes from the spline rather than the
+near-field line, and it remains the weakest signal: raw curvature still flips sign on 48 of
+98 frame transitions, carrying almost no information about which way the road bends until
+filtered. Association is also still imperfect, with the lane count changing on 71 of 99
+transitions as the mask fires on barriers and reflective strips. The drawn end still moves
+by about 32 px per frame, since bounded extension cannot invent the 200 rows that would be
+needed to pin it to the frame edge. And 0.12 m of filtered offset variation per frame is
+still more than a controller should track. The geometry is markedly better than it was and
+still not good enough to drive on.
 
 ## Roadmap toward the controller
 

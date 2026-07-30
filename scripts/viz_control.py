@@ -36,7 +36,7 @@ from src.data.subset import read_manifest
 from src.data.transforms import build_eval_transform
 from src.geometry.calibration import CameraCalibration, ground_plane_from_calibration
 from src.geometry.centerline import ego_lane_pair, extract_lane_polylines
-from src.geometry.road_geometry import road_geometry
+from src.geometry.road_geometry import DEFAULT_OFFSET_DISTANCE_M, road_geometry
 from src.geometry.temporal import RoadGeometryFilter
 from src.models.lane_segmenter import LaneSegmenter
 from scripts.infer_sequence import _center_crop_aspect, _frames_from_source, _predict
@@ -162,7 +162,7 @@ def _draw_trace_strip(width, hist):
 
 
 def _render(image_rgb, mask, polylines, centre_img, geom, ground, previews,
-            filtered=None, hist=None):
+            filtered=None, hist=None, offset_distance_m=DEFAULT_OFFSET_DISTANCE_M):
     """Compose the camera panel and the bird's-eye panel into one frame."""
     h, w = image_rgb.shape[:2]
     left = image_rgb.copy()
@@ -208,7 +208,7 @@ def _render(image_rgb, mask, polylines, centre_img, geom, ground, previews,
         cv2.putText(panel, "filtered", (208, h - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.33,
                     COL_FILT, 1, cv2.LINE_AA)
         rows = [
-            ("offset", f"{geom.lateral_offset_m:+.2f}",
+            (f"offset@{geom.offset_distance_m:g}m", f"{geom.lateral_offset_m:+.2f}",
              f"{filtered.lateral_offset_m:+.2f}" if filtered else "", "m"),
             ("heading", f"{math.degrees(geom.heading_error_rad):+.1f}",
              f"{math.degrees(filtered.heading_error_rad):+.1f}" if filtered else "", "deg"),
@@ -268,6 +268,15 @@ def main(cfg: DictConfig) -> None:
     hist = {k: deque([None] * TRACE_WINDOW, maxlen=TRACE_WINDOW)
             for k in ("offset_raw", "offset_filt", "kappa_raw", "kappa_filt")}
 
+    # Optionally also write each composed frame as PNG. Building the GIF from these
+    # avoids inheriting the video codec's artifacts.
+    frames_dir = None
+    if bool(cfg.infer.get("dump_frames", False)):
+        frames_dir = out_dir / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        for stale in frames_dir.glob("*.png"):
+            stale.unlink()
+
     max_frames = cfg.infer.get("max_frames", None)
     n = detected = 0
     for rgb in _frames_from_source(source, max_frames):
@@ -278,7 +287,8 @@ def main(cfg: DictConfig) -> None:
         polylines = extract_lane_polylines(pred)
         from src.geometry.centerline import ego_centerline
 
-        centre_img = ego_centerline(polylines, target_size[0])
+        centre_img = ego_centerline(polylines, target_size[0],
+                                    image_height=target_size[1])
         geom = (
             road_geometry(centre_img, ground, previews)
             if centre_img is not None else None
@@ -291,7 +301,10 @@ def main(cfg: DictConfig) -> None:
         hist["kappa_filt"].append(smoothed.curvature_1pm)
         frame = _render(image, pred, polylines, centre_img, geom, ground, previews,
                         smoothed, hist)
-        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        writer.write(bgr)
+        if frames_dir is not None:
+            cv2.imwrite(str(frames_dir / f"{n:04d}.png"), bgr)
         n += 1
     writer.release()
     print(f"wrote {n} frames ({detected} with an ego lane) -> {out_path}")
