@@ -34,21 +34,11 @@ relative to their natural frequency.
 *Figure 1. Natural vs. stratified training distribution over curvature bins (log scale).
 The subset is flat by construction, so the tails are lifted relative to nature.*
 
-The model is a U-Net with an ImageNet-pretrained ResNet-18 encoder (14.3 M parameters).
-It trains on 512×288 crops with an equal-weight Dice + BCE objective, Adam at 1e-3 on a
-cosine schedule, batch size 8, mixed precision. Preprocessing applies an aspect-preserving
-sky crop followed by an isotropic resize, so the resize does not distort curvature and the
-stratification label stays valid. Validation runs on a separately stratified 2,000-frame
-set. On a 6 GB RTX 3060 an epoch takes about 2.5 minutes and uses 2.4 GB, well under the
-memory budget.
-
-Validation IoU (Figure 2) climbs quickly and plateaus around epoch 40. The best
-checkpoint is epoch 48 at 0.616. The early kink is a resume after a power interruption,
-not a property of the schedule.
-
-![Validation IoU over training](docs/assets/fig_learning_curve.png)
-
-*Figure 2. Foreground IoU on the validation set across 50 epochs.*
+The model is a U-Net with an ImageNet-pretrained ResNet-18 encoder, trained on 512×288
+crops with a Dice + BCE objective, which a later section makes curvature-aware.
+Preprocessing applies an aspect-preserving sky crop followed by an isotropic resize, so the
+resize does not distort curvature and the stratification label stays valid. Validation runs
+on a separately stratified 2,000-frame set.
 
 ## Accuracy across curvature
 
@@ -61,7 +51,7 @@ excluded as uninformative. Broken out by bin:
 | Dice | 0.762 | 0.740 | 0.766 | 0.776 | 0.765 | 0.773 |
 
 Accuracy does not fall off with curvature. The near-straight bin is the weakest and the
-curved bins are marginally better (Figure 3). This is the stratified sampling working as
+curved bins are marginally better (Figure 2). This is the stratified sampling working as
 intended: with the tight-curve regime lifted to equal weight during training, the model
 does not treat it as a rare corner case. The near-straight bin lags for a geometric
 reason, not a modelling one. A near-straight lane runs thin all the way to the vanishing
@@ -71,7 +61,7 @@ have hidden this, which is the argument for stratifying the metric.
 
 ![Per-bin IoU across curvature](docs/assets/fig_per_bin_iou.png)
 
-*Figure 3. Per-bin IoU on the held-in validation set and on a held-out split. The dashed
+*Figure 2. Per-bin IoU on the held-in validation set and on a held-out split. The dashed
 line is the overall validation IoU. The tightest bin was not sampled in the
 natural-distribution held-out draw (n=0).*
 
@@ -81,10 +71,47 @@ To confirm these numbers are not an artifact of the validation set, we evaluated
 frames from the CurveLanes `valid` split that belong to neither the training subset nor
 the validation subset. They are unseen by both training and checkpoint selection. Overall
 IoU there is 0.640, slightly above the validation figure, so the model is not overfit.
-The per-bin pattern holds (Figure 3, orange). The tightest bin is empty in this draw
+The per-bin pattern holds (Figure 2, orange). The tightest bin is empty in this draw
 because the sample follows the natural distribution, where such frames are rare. That gap
 is itself the reason stratified training was necessary, even when stratified evaluation
 cannot populate every bin.
+
+### Across cameras, not just across splits
+
+The stronger test is a different camera on a different continent. The clip below is a KITTI
+drive on a German rural road: shaded, narrow, with a dashed centre line and a solid edge
+line rather than the wide highway markings the model trained on. Nothing about it was seen
+in training, and no fine-tuning was done.
+
+<p align="center">
+  <img src="docs/assets/kitti_demo.gif" alt="The chain running on a KITTI rural road" width="760">
+</p>
+
+<p align="center"><em>Nine continuous seconds at 10 Hz on KITTI drive 2011_09_26_0027,
+every frame yielding an ego lane. The bird's-eye panel uses KITTI's own camera parameters,
+not the TuSimple calibration used elsewhere in this README.</em></p>
+
+The chain recovers an ego lane on **178 of 188 frames (94.7%)** across the whole drive,
+which is close to what it manages on TuSimple and far better than its 73.5% on the
+CurveLanes validation split. That ordering is not a contradiction: the CurveLanes split is
+deliberately curvature-flattened, so it is dominated by the tight curves the model is worst
+at, while both video sequences are ordinary driving.
+
+The metric panel is worth a note, because it started out wrong. Applying the TuSimple
+calibration to KITTI produced a confident and meaningless picture, with the whole road
+collapsed into a wedge around 12 m. KITTI ships its camera parameters, so the intrinsics
+were mapped through the same crop-and-resize chain the images take, giving fx=789, cx=245,
+cy=67 at 512x288. Pitch was then fitted by the lane-parallelism routine used for TuSimple,
+returning **-0.38 degrees** rather than the zero that a rectified camera invites you to
+assume. The check that it is right is the same one used throughout: the recovered
+boundaries run parallel from 8 m to 32 m, at a separation of **2.75 m**, which is the
+standard width of a German *Landstrasse* lane.
+
+Two things remain approximate. Lane width still drifts about 4% between 8 m and 30 m, so
+the flat-ground assumption is imperfect on a road that visibly undulates. And the camera
+height that comes out, 1.567 m against KITTI's specified 1.65 m, is absorbing the assumed
+lane width: height and width are degenerate, as the calibration section below explains, so
+one of them has to be asserted.
 
 ## Control-relevant error, and why IoU was misleading
 
@@ -137,7 +164,113 @@ those. Ambiguous ego-lane selection on wide, near-parallel markings pairing the 
 boundaries is the remaining candidate. Nothing is claimed from that column.
 
 The practical conclusion is that another point of IoU was the wrong thing to chase.
-Detection reliability on curves is what limits this model as a control front end.
+Detection reliability on curves is what limits this model as a control front end. The next
+section acts on that: the objective is made curvature-aware and the failure this section
+measures is largely removed.
+
+## Curvature-aware objective
+
+The finding above is that detection fails where the road bends. Until this point the
+model had no way to act on it: the loss took a mask and logits, and the only consumer of
+a frame's curvature was the validation metric. The project stratified its *data* and its
+*metrics* by curvature and left its *objective* blind to it, which is a fair reading of
+why the name overpromised.
+
+Two mechanisms close that gap, both off by default so the baseline stays reproducible.
+**Per-sample curvature weighting** multiplies a frame's loss by `1 + w·b/(K-1)` for
+curvature bin `b` of `K`, so the sharpest bin counts `(1+w)` times the straightest;
+stratified sampling had equalized how *often* a curved frame is seen, not how much it
+contributes once seen. An **auxiliary head** regresses the frame's curvature from the
+encoder bottleneck, which does not change what the segmenter outputs but forces the
+representation to carry curvature at all.
+
+Weighting is by bin rather than by raw curvature because the per-bin median curvature on
+the training subset runs 0.73, 2.00, 6.27, 21.08, 53.39: a seventy-fold range with a long
+tail, on which any weight linear in curvature becomes a step function handing most of the
+batch gradient to whichever frame is sharpest. Weights are mean-normalized within each
+batch, so enabling them does not also change the effective learning rate.
+
+![Detection rate against curvature for three weighting strengths](docs/assets/fig_curvature_objective.png)
+
+*Figure 3. Detection rate per curvature bin, and the straight-to-tightest gap, for three
+weighting strengths. Same 1,768 validation frames throughout.*
+
+| run | val IoU | tightest bin | overall | straight − tightest | TuSimple (unseen camera) |
+|---|---|---|---|---|---|
+| baseline | **0.6161** | 60.5% | 73.5% | +21.6 | **95.3%** |
+| w=0.5, aux 0.1 | 0.6031 | 74.6% | 79.9% | +9.3 | 75.3% |
+| w=1.0, aux 0.1 | 0.6008 | **82.5%** | **83.3%** | **+3.9** | 88.2% |
+| w=1.0, no aux | 0.6070 | 73.7% | 78.1% | +11.4 | 85.0% |
+
+**In-domain the objective does what it was designed to do.** Detection improves in every
+bin, monotonically with weighting strength, and the curvature-dependent failure the
+project was built around collapses from a 21.6-point gap to 3.9. On the tightest bin it
+goes 60.5% to 82.5%, which is 172 frames that previously yielded no usable ego lane at
+all. The overall gain is 7.1 standard errors on a fixed frame set, and the *shape* of it
+matches the intervention: the gain grows with curvature, from +4.2 points on near-straight
+frames to +21.9 on the tightest, where a generically better model would have lifted every
+bin alike.
+
+It is not bought by predicting more lane. The weighted model emits slightly *fewer*
+foreground pixels than the baseline (0.999 against 1.007 of the ground-truth volume) at
+marginally lower pixel precision and recall, and still recovers a usable ego lane far more
+often. The mask is arranged better along the lane rather than being larger, which is this
+project's thesis stated as an experiment: overlap and usable geometry are different
+quantities, and a little of the first buys a lot of the second.
+
+**Out of domain it costs.** On 600 frames of TuSimple, a camera the model never trained
+on, every weighted variant loses ground against the baseline's 95.3%. The ablation was
+run expecting the auxiliary head to be responsible; it is not. Removing the head made both
+axes worse, so the head contributes about five points of the in-domain gain and the
+out-of-domain cost belongs to the curvature weighting itself. Weighting frames by their
+curvature specializes the model to one dataset's mix of curves, and that mix is a property
+of CurveLanes rather than of driving.
+
+**A geometric weighting was tried and is worse.** If the cost comes from specializing to
+one dataset's curve mix, then weighting *pixels by image row* rather than *frames by
+curvature* should avoid it: the far field is where the controller needs geometry and where
+the lane is lost, and that argument makes no reference to how many curves the training set
+contains. It did not survive contact. Far-field weighting reached 78.2% in-domain, below
+every curvature-weighted variant, and 72.0% on TuSimple, the worst of any run.
+
+What that failure exposed is the actual mechanism. Out-of-domain detection tracks how much
+foreground a model emits, not how it was weighted: 5174 lane pixels per frame for the
+baseline at 95.3%, 4766 at 88.2%, 3819 at 85.0%, 3589 at 72.0%. Every weighted objective
+makes the model more conservative, and out of domain a thinner mask fragments into
+boundaries that no longer pair into a lane.
+
+That reframes the cost as **calibration rather than capability**, which is testable without
+retraining anything. Sweeping the decision threshold on TuSimple, the baseline is best at
+the default 0.5 and degrades monotonically below it, while the curvature-aware model peaks
+at 0.4:
+
+| threshold | 0.5 | 0.4 | 0.3 | 0.25 | 0.2 |
+|---|---|---|---|---|---|
+| baseline | **95.3%** | 94.8 | 93.2 | 91.2 | 89.5 |
+| curvature-aware | 88.2 | **93.3%** | 88.5 | 87.0 | 85.5 |
+
+Recalibrating recovers 5.1 of the 7.1 lost points. It costs some of the in-domain gain, so
+the model offers a trade the baseline cannot reach at any threshold — the baseline is worse
+in-domain at 0.4 (68.0%) than at 0.5 (73.5%), so 0.5 really is its best operating point:
+
+| operating point | in-domain detection | TuSimple |
+|---|---|---|
+| baseline @ 0.5 | 73.5% | 95.3% |
+| curvature-aware @ 0.5 | **83.3%** (+9.8) | 88.2% (−7.1) |
+| curvature-aware @ 0.4 | 80.2% (+6.7) | 93.3% (−2.0) |
+
+The general lesson is worth more than the numbers: comparing two models at one fixed
+threshold conflates what they can do with where they sit on their own operating curve. Most
+of what looked like a robustness failure was the second thing.
+
+Three caveats, since the table invites over-reading. Each configuration is a single run at
+one seed, so the in-domain ordering is supported by a dose-response across three strengths
+but the out-of-domain magnitudes are not ordered by strength at all and are plainly noisy;
+only their sign is consistent. IoU falls in every variant, which on a segmentation
+leaderboard reads as a regression and is exactly the point. And 83% detection is better,
+not good: roughly one frame in six still yields no usable ego lane, which for a controller
+is a hand-back every few seconds. What changed is the *shape* of the failure, from
+concentrated on the curves that matter to spread evenly, which is the healthier of the two.
 
 ## Metric calibration, and what the numbers can support
 
