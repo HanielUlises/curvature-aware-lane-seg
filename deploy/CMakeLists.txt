@@ -7,6 +7,16 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# The per-frame path is the mask decomposition and the tracker, so the release build is
+# tuned for it: -O3, and NDEBUG to drop Eigen's per-access assertions. Native tuning is
+# opt-in rather than default, since a binary built with it will not run on an older CPU
+# than the one that built it, which is the wrong default for a deployment artefact.
+option(CURVATURE_PORT_NATIVE "Tune for the building machine's CPU" OFF)
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+if(CURVATURE_PORT_NATIVE)
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
+endif()
+
 # Eigen: prefer a config package, fall back to the common system include dir.
 find_package(Eigen3 QUIET)
 if(NOT TARGET Eigen3::Eigen)
@@ -18,7 +28,8 @@ if(NOT TARGET Eigen3::Eigen)
 endif()
 
 add_library(curvature_port src/spline.cpp src/curvature.cpp src/ipm.cpp
-                           src/road_geometry.cpp)
+                           src/road_geometry.cpp src/centerline.cpp
+                           src/lane_tracker.cpp)
 target_include_directories(curvature_port PUBLIC include PRIVATE src)
 if(TARGET Eigen3::Eigen)
   target_link_libraries(curvature_port PUBLIC Eigen3::Eigen)
@@ -39,3 +50,9 @@ target_link_libraries(test_geometry PRIVATE curvature_port)
 target_compile_definitions(test_geometry PRIVATE
                            GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/golden")
 add_test(NAME geometry_golden COMMAND test_geometry)
+
+add_executable(test_pipeline test/test_pipeline.cpp)
+target_link_libraries(test_pipeline PRIVATE curvature_port)
+target_compile_definitions(test_pipeline PRIVATE
+                           GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/golden")
+add_test(NAME pipeline_golden COMMAND test_pipeline)
