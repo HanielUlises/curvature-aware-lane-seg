@@ -76,6 +76,9 @@ def main(cfg: DictConfig) -> None:
             weight_decay=cfg.model.weight_decay,
             dice_weight=cfg.model.dice_weight,
             lovasz_weight=cfg.model.get("lovasz_weight", 0.0),
+            curvature_weight=cfg.model.get("curvature_weight", 0.0),
+            aux_curvature_weight=cfg.model.get("aux_curvature_weight", 0.0),
+            far_field_weight=cfg.model.get("far_field_weight", 0.0),
         )
     else:
         model = LaneSegmenter(
@@ -86,6 +89,9 @@ def main(cfg: DictConfig) -> None:
             weight_decay=cfg.model.weight_decay,
             dice_weight=cfg.model.dice_weight,
             lovasz_weight=cfg.model.get("lovasz_weight", 0.0),
+            curvature_weight=cfg.model.get("curvature_weight", 0.0),
+            aux_curvature_weight=cfg.model.get("aux_curvature_weight", 0.0),
+            far_field_weight=cfg.model.get("far_field_weight", 0.0),
         )
 
     run_dir = Path(hydra.core.hydra_config.HydraConfig.get().runtime.output_dir)

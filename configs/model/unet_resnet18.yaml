@@ -5,3 +5,22 @@ lr: 1.0e-3
 weight_decay: 1.0e-4
 dice_weight: 0.5   # base loss = dice_weight * Dice + (1 - dice_weight) * BCE
 lovasz_weight: 0.0 # loss = (1 - lovasz_weight) * base + lovasz_weight * Lovasz-hinge
+
+# Curvature-aware objective. Both default to 0, which reproduces the baseline exactly:
+# the loss then never sees a frame's curvature, which was the gap between what this
+# project is called and what the model actually optimized.
+#
+# curvature_weight  per-sample loss weight of 1 + w * b/(K-1) for curvature bin b of K,
+#                   so the sharpest bin counts (1 + w) times the straightest. Weights are
+#                   mean-normalized per batch, so this does not also change the step size.
+# aux_curvature_weight  weight on an auxiliary head regressing the frame's curvature from
+#                   the encoder bottleneck. Does not alter the segmenter's output; it
+#                   constrains the representation to carry curvature at all.
+curvature_weight: 0.0
+aux_curvature_weight: 0.0
+# far_field_weight  per-pixel loss weight rising towards the top of the frame, from 1 at
+#                   the bottom row to 1 + w at the top, mean-normalized. Attacks the same
+#                   failure as curvature weighting but geometrically rather than
+#                   distributionally: the controller needs far-field geometry, and that is
+#                   where the ego lane is lost. Independent of the dataset's curve mix.
+far_field_weight: 0.0

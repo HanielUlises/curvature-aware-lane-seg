@@ -16,6 +16,13 @@ import torch
 from torch import nn
 
 from src.eval.metrics import StratifiedSegMetric
+from src.models.curvature_loss import (
+    CurvatureHead,
+    curvature_weights,
+    far_field_weights,
+    per_sample_bce,
+    per_sample_dice,
+)
 
 
 class LaneSegmenter(pl.LightningModule):
@@ -28,6 +35,11 @@ class LaneSegmenter(pl.LightningModule):
         lr: Adam learning rate.
         weight_decay: Adam weight decay.
         dice_weight: Weight on the Dice term (BCE term is ``1 - dice_weight``).
+        curvature_weight: Strength of per-sample curvature weighting. ``0`` reproduces
+            the baseline objective exactly; ``1`` weights the sharpest curvature bin
+            twice the straightest.
+        aux_curvature_weight: Weight on the auxiliary curvature-regression head. ``0``
+            leaves the head out of the model entirely.
     """
 
     def __init__(
@@ -39,6 +51,9 @@ class LaneSegmenter(pl.LightningModule):
         weight_decay: float = 1e-4,
         dice_weight: float = 0.5,
         lovasz_weight: float = 0.0,
+        curvature_weight: float = 0.0,
+        aux_curvature_weight: float = 0.0,
+        far_field_weight: float = 0.0,
     ) -> None:
         super().__init__()
         # bin_edges is data, not a hyperparameter to reconstruct the model from.
@@ -56,15 +71,55 @@ class LaneSegmenter(pl.LightningModule):
         self.lovasz_loss = smp.losses.LovaszLoss(mode="binary", from_logits=True)
         self.dice_weight = dice_weight
         self.lovasz_weight = lovasz_weight
+        self.curvature_weight = curvature_weight
+        self.aux_curvature_weight = aux_curvature_weight
+        self.far_field_weight = far_field_weight
+        self._row_weights: torch.Tensor | None = None
+        # A buffer so it follows the model onto the device, but deliberately not
+        # persistent: every load path already passes the manifest's edges explicitly, and
+        # putting them in the state dict would make checkpoints trained before this
+        # existed fail to load, and would let a checkpoint's edges silently disagree with
+        # the manifest the metric is using.
+        self.register_buffer(
+            "bin_edges", torch.tensor(bin_edges, dtype=torch.float32), persistent=False
+        )
+        self.curvature_head = (
+            CurvatureHead(self.net.encoder.out_channels[-1])
+            if aux_curvature_weight > 0
+            else None
+        )
         self.val_metric = StratifiedSegMetric(bin_edges)
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         return self.net(image)
 
-    def _loss(self, logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        base = self.dice_weight * self.dice_loss(logits, mask) + (
-            1.0 - self.dice_weight
-        ) * self.bce_loss(logits, mask)
+    def _loss(
+        self, logits: torch.Tensor, mask: torch.Tensor, kappa: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        rows = None
+        if self.far_field_weight > 0:
+            # Cached per height: the frame size does not change within a run.
+            if self._row_weights is None or self._row_weights.shape[2] != logits.shape[2]:
+                self._row_weights = far_field_weights(
+                    logits.shape[2], self.far_field_weight, dtype=torch.float32
+                )
+            rows = self._row_weights.to(logits.device, logits.dtype)
+
+        if (self.curvature_weight > 0 and kappa is not None) or rows is not None:
+            # Per-sample so the weight can be applied before the batch is pooled.
+            weights = (
+                curvature_weights(kappa, self.bin_edges, self.curvature_weight)
+                if (self.curvature_weight > 0 and kappa is not None)
+                else torch.ones(logits.shape[0], device=logits.device, dtype=logits.dtype)
+            )
+            per_sample = self.dice_weight * per_sample_dice(logits, mask, rows) + (
+                1.0 - self.dice_weight
+            ) * per_sample_bce(logits, mask, rows)
+            base = (weights * per_sample).mean()
+        else:
+            base = self.dice_weight * self.dice_loss(logits, mask) + (
+                1.0 - self.dice_weight
+            ) * self.bce_loss(logits, mask)
         if self.lovasz_weight > 0:
             return (1.0 - self.lovasz_weight) * base + self.lovasz_weight * self.lovasz_loss(
                 logits, mask
@@ -72,8 +127,20 @@ class LaneSegmenter(pl.LightningModule):
         return base
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
-        logits = self(batch["image"])
-        loss = self._loss(logits, batch["mask"])
+        kappa = batch["kappa"]
+        if self.curvature_head is None:
+            logits = self(batch["image"])
+        else:
+            # Run the segmenter in two halves so the encoder's bottleneck is available
+            # to the auxiliary head without a second forward pass.
+            features = self.net.encoder(batch["image"])
+            logits = self.net.segmentation_head(self.net.decoder(features))
+        loss = self._loss(logits, batch["mask"], kappa)
+        self.log("train/seg_loss", loss, on_step=False, on_epoch=True)
+        if self.curvature_head is not None:
+            aux = CurvatureHead.loss(self.curvature_head(features[-1]), kappa)
+            self.log("train/aux_curvature", aux, on_step=False, on_epoch=True)
+            loss = loss + self.aux_curvature_weight * aux
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         return loss
 
@@ -82,7 +149,7 @@ class LaneSegmenter(pl.LightningModule):
 
     def validation_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         logits = self(batch["image"])
-        loss = self._loss(logits, batch["mask"])
+        loss = self._loss(logits, batch["mask"], batch["kappa"])
         self.val_metric.update(torch.sigmoid(logits), batch["mask"], batch["kappa"])
         self.log("val/loss", loss, prog_bar=True, on_epoch=True)
         return loss
