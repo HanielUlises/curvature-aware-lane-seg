@@ -35,7 +35,12 @@ from omegaconf import DictConfig
 from src.data.subset import read_manifest
 from src.data.transforms import build_eval_transform
 from src.geometry.calibration import CameraCalibration, ground_plane_from_calibration
-from src.geometry.centerline import ego_lane_pair, extract_lane_polylines
+from src.geometry.centerline import (
+    ego_centerline,
+    ego_lane_pair,
+    extract_lane_polylines,
+)
+from src.geometry.lane_tracker import EgoBoundaryTracker
 from src.geometry.road_geometry import DEFAULT_OFFSET_DISTANCE_M, road_geometry
 from src.geometry.temporal import RoadGeometryFilter
 from src.models.lane_segmenter import LaneSegmenter
@@ -94,11 +99,58 @@ def _draw_bev_grid(panel: np.ndarray) -> None:
     cv2.rectangle(panel, (u0 - 9, v0 - 16), (u0 + 9, v0), (110, 110, 120), -1)
 
 
-def _draw_ground_polyline(panel: np.ndarray, pts: np.ndarray, colour, radius=1) -> None:
+# How the recovered geometry is drawn: "scatter" marks the sampled points, "line" joins
+# them. Scatter shows what the estimate actually is, a finite set of samples, and keeps the
+# drawing honest about resolution; the earlier gappy look it had was a symptom of unstable
+# geometry rather than of the style, and is fixed in the tracker.
+DRAW_STYLE = "scatter"
+# Spacing between drawn markers, in pixels, so the dots stay evenly spread whatever the
+# sample density of the underlying polyline. Each has to exceed its marker's diameter or
+# the markers merge back into a stroke, which is what the spline's own sample spacing did.
+SCATTER_SPACING_PX = 5.0
+CENTER_SCATTER_SPACING_PX = 6.0
+# Marker radii. Small: the markers are there to show where the estimate is sampled, and a
+# heavy one buries the road it is drawn over. The centreline gets one pixel more than the
+# boundaries because it is the line the controller tracks and should read first.
+MARKER_RADIUS = 1
+CENTER_MARKER_RADIUS = 2
+
+
+def _resample_even(pts: np.ndarray, spacing: float) -> np.ndarray:
+    """Points along a polyline at a roughly constant pixel spacing."""
+    pts = np.asarray(pts, dtype=np.float64)
+    if pts.shape[0] < 2:
+        return pts
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    dist = np.concatenate([[0.0], np.cumsum(seg)])
+    total = dist[-1]
+    if total <= 0.0:
+        return pts[:1]
+    n = max(int(total / max(spacing, 1e-6)) + 1, 2)
+    want = np.linspace(0.0, total, n)
+    return np.column_stack([np.interp(want, dist, pts[:, 0]),
+                            np.interp(want, dist, pts[:, 1])])
+
+
+def _draw_ground_polyline(panel: np.ndarray, pts: np.ndarray, colour, radius=1,
+                          spacing: float = SCATTER_SPACING_PX) -> None:
+    """Draw a ground-plane polyline in the bird's-eye panel."""
     h = panel.shape[0]
-    for x, z in pts:
-        if 0.0 <= z <= Z_MAX_M and abs(x) <= X_MAX_M:
-            cv2.circle(panel, _bev_point(float(x), float(z), h), radius, colour, -1)
+    std_radius = max(int(radius), 1)
+    inside = [(0.0 <= z <= Z_MAX_M and abs(x) <= X_MAX_M) for x, z in pts]
+    kept = np.array([p for p, ok in zip(pts, inside) if ok], dtype=np.float64)
+    if kept.shape[0] < 2:
+        return
+    uv = np.array([_bev_point(float(x), float(z), h) for x, z in kept], dtype=np.float64)
+    if DRAW_STYLE == "scatter":
+        for x, y in _resample_even(uv, spacing):
+            cv2.circle(panel, (int(round(x)), int(round(y))), std_radius, colour, -1,
+                       cv2.LINE_AA)
+        return
+    for i in range(len(uv) - 1):
+        cv2.line(panel, tuple(np.round(uv[i]).astype(int)),
+                 tuple(np.round(uv[i + 1]).astype(int)), colour,
+                 max(int(radius) * 2, 2), cv2.LINE_AA)
 
 
 def _draw_trace(panel, x0, width, raw, filt, label, unit):
@@ -161,40 +213,104 @@ def _draw_trace_strip(width, hist):
     return panel
 
 
+# Rows over which the centreline's near end fades out, in image rows rather than as a
+# fraction of the line. How far the line reaches depends on where the mask happens to
+# detect boundaries, so its near end retracts and extends between frames; a hard endpoint
+# turns that into a visible pop. An absolute fade keeps the tip soft at any length, so a
+# retraction changes how far a soft edge sits rather than snapping a bright one.
+CENTER_FADE_ROWS = 46
+# Rows between which the line dims regardless of where it happens to end. Without this
+# the bright part of the line is exactly as long as the detection, so a frame that
+# recovers 60 extra rows lights up a visibly longer line. The range has to cover where the
+# lines actually end, which on this footage is a mean row of 136 spread over 79 to 233. Set
+# past that, as it first was at (150, 240), it almost never engages and the bright end
+# flickers with the detection. Set here it pins the bright section and leaves the varying
+# part in the dim region, which is also the honest place for it: that is the part of the
+# lane the mask is least sure of.
+CENTER_DEPTH_FADE = (100.0, 175.0)
+
+
+def _draw_centerline(canvas, centre_img, fade_rows=CENTER_FADE_ROWS,
+                     depth_fade=CENTER_DEPTH_FADE):
+    """Draw the ego centreline, faded out towards the vehicle.
+
+    Marked at an even pixel spacing rather than at the spline's own sample spacing, which
+    is fine enough that the markers would merge into a stroke. Opacity is the lesser of
+    two fades: one from the line's own near end, which keeps the tip soft at any length,
+    and one in image rows, which keeps the marked section in the same place from frame to
+    frame. Positions are untouched; only opacity varies.
+    """
+    pts = np.asarray(centre_img, dtype=np.float64)
+    if pts.shape[0] < 2:
+        return
+    near_row = float(pts[:, 1].max())
+    depth_lo, depth_hi = depth_fade
+    marks = (_resample_even(pts, CENTER_SCATTER_SPACING_PX) if DRAW_STYLE == "scatter"
+             else pts)
+    for i in range(1, marks.shape[0]):
+        p0, p1 = marks[i - 1], marks[i]
+        row = float(max(p0[1], p1[1]))
+        depth = near_row - row
+        alpha = min(depth / float(fade_rows), 1.0) if fade_rows > 0 else 1.0
+        if depth_hi > depth_lo:
+            alpha = min(alpha, 1.0 - (row - depth_lo) / (depth_hi - depth_lo))
+        alpha = max(alpha, 0.0) ** 0.7
+        if alpha <= 0.03:
+            continue
+        overlay = canvas.copy()
+        if DRAW_STYLE == "scatter":
+            cv2.circle(overlay, (int(round(p1[0])), int(round(p1[1]))),
+                       CENTER_MARKER_RADIUS, COL_CENTER, -1, cv2.LINE_AA)
+        else:
+            cv2.line(overlay, (int(round(p0[0])), int(round(p0[1]))),
+                     (int(round(p1[0])), int(round(p1[1]))), COL_CENTER,
+                     CENTER_MARKER_RADIUS, cv2.LINE_AA)
+        cv2.addWeighted(overlay, alpha, canvas, 1.0 - alpha, 0.0, dst=canvas)
+
+
+def _draw_boundary(canvas, poly, colour=COL_LANE, thickness=2):
+    """Draw one lane boundary, scattered or joined according to DRAW_STYLE."""
+    pts = np.asarray(poly, dtype=np.float64)
+    if pts.shape[0] < 2:
+        return
+    if DRAW_STYLE == "scatter":
+        for x, y in _resample_even(pts, SCATTER_SPACING_PX):
+            cv2.circle(canvas, (int(round(x)), int(round(y))), MARKER_RADIUS, colour, -1,
+                       cv2.LINE_AA)
+        return
+    cv2.polylines(canvas, [pts.astype(np.int32).reshape(-1, 1, 2)], False, colour,
+                  thickness, cv2.LINE_AA)
+
+
 def _render(image_rgb, mask, polylines, centre_img, geom, ground, previews,
-            filtered=None, hist=None, offset_distance_m=DEFAULT_OFFSET_DISTANCE_M):
-    """Compose the camera panel and the bird's-eye panel into one frame."""
+            filtered=None, hist=None, offset_distance_m=DEFAULT_OFFSET_DISTANCE_M,
+            ego_pair=None):
+    """Compose the camera panel and the bird's-eye panel into one frame.
+
+    ``ego_pair`` is the two boundaries of the ego lane to draw, tracked where tracking
+    is enabled. The full per-frame detection set is still drawn underneath it, dimmed:
+    it is what the segmenter actually produced and appears and disappears accordingly,
+    so giving it the same visual weight as the ego lane makes the frame look far noisier
+    than the geometry being measured.
+    """
     h, w = image_rgb.shape[:2]
     left = image_rgb.copy()
     red = np.zeros_like(left)
     red[..., 0], red[..., 1], red[..., 2] = COL_MASK
     m = mask.astype(bool)
     left[m] = (0.45 * red[m] + 0.55 * left[m]).astype(np.uint8)
-    for poly in polylines:
-        for x, y in poly.astype(int):
-            cv2.circle(left, (x, y), 1, COL_LANE, -1)
+    if ego_pair is None:
+        for poly in polylines:
+            _draw_boundary(left, poly, COL_LANE, 2)
+    else:
+        # Only the ego lane's own boundaries. Every other component the segmenter found
+        # is already visible in the red mask underneath, and tracing them as well adds a
+        # second set of lines that appear and vanish frame to frame without carrying any
+        # information the mask does not already show.
+        for lane in ego_pair:
+            _draw_boundary(left, lane, COL_LANE, 2)
     if centre_img is not None:
-        # Fade the near end. How far the centreline reaches depends on where the mask
-        # happens to detect boundaries, which varies frame to frame, so a hard endpoint
-        # draws the eye to an extent that carries no information. The positions drawn
-        # are unchanged; only their opacity near the end is.
-        pts = centre_img.astype(int)
-        n_pts = len(pts)
-        fade_from = int(n_pts * 0.65)
-        for i, (x, y) in enumerate(pts):
-            if not (0 <= x < w and 0 <= y < h):
-                continue
-            alpha = 1.0
-            if i >= fade_from and n_pts > fade_from:
-                alpha = 1.0 - (i - fade_from) / max(n_pts - fade_from, 1)
-                alpha = max(alpha, 0.0) ** 0.8
-            if alpha <= 0.02:
-                continue
-            patch = left[max(y - 2, 0):y + 3, max(x - 2, 0):x + 3].astype(np.float32)
-            blend = np.array(COL_CENTER, dtype=np.float32)
-            left[max(y - 2, 0):y + 3, max(x - 2, 0):x + 3] = (
-                (1 - alpha) * patch + alpha * blend
-            ).astype(np.uint8)
+        _draw_centerline(left, centre_img)
 
     panel = np.full((h, BEV_WIDTH, 3), 38, dtype=np.uint8)
     _draw_bev_grid(panel)
@@ -208,11 +324,16 @@ def _render(image_rgb, mask, polylines, centre_img, geom, ground, previews,
         cv2.putText(panel, note, (BEV_WIDTH // 2 - 62, h // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 210), 1, cv2.LINE_AA)
     else:
-        pair = ego_lane_pair(polylines, w)
+        pair = ego_pair if ego_pair is not None else ego_lane_pair(polylines, w)
         if pair is not None:
             for lane in pair:
                 _draw_ground_polyline(panel, ground.to_ground(lane), COL_LANE)
-        _draw_ground_polyline(panel, geom.ground_centerline, COL_CENTER, radius=2)
+        # Same marker size as the boundaries, spaced a little wider: in the bird's-eye
+        # view the centreline is much denser in pixels than the boundaries are, so an
+        # equal spacing there packs it into a solid bar.
+        _draw_ground_polyline(panel, geom.ground_centerline, COL_CENTER,
+                              radius=CENTER_MARKER_RADIUS,
+                              spacing=CENTER_SCATTER_SPACING_PX)
         # Preview markers where curvature is reported to the controller.
         for dist, kappa in zip(previews, geom.preview_curvature_1pm):
             if dist <= Z_MAX_M and not np.isnan(kappa):
@@ -284,6 +405,17 @@ def main(cfg: DictConfig) -> None:
         (target_size[0] + BEV_WIDTH, target_size[1] + TRACE_HEIGHT),
     )
     filt = RoadGeometryFilter(dt=1.0 / max(float(cfg.infer.fps), 1.0))
+    # The tracker gives the centreline frame-to-frame identity; the Kalman filter
+    # downstream smooths the scalars read off it. They address different things and
+    # both are reported, so the trace strip still shows what the raw read-out does.
+    tracker = None
+    if bool(cfg.infer.get("track_ego_lane", False)):
+        tracker = EgoBoundaryTracker(
+            target_size[0], target_size[1],
+            alpha=float(cfg.infer.get("track_alpha", 0.45)),
+            gate_px=float(cfg.infer.get("track_gate_px", 55.0)),
+            max_coast_frames=int(cfg.infer.get("track_max_coast", 8)),
+        )
     hist = {k: deque([None] * TRACE_WINDOW, maxlen=TRACE_WINDOW)
             for k in ("offset_raw", "offset_filt", "kappa_raw", "kappa_filt")}
 
@@ -304,10 +436,23 @@ def main(cfg: DictConfig) -> None:
             model, rgb, transform, target_size, cfg.data.sky_frac, cfg.infer.tta, device
         )
         polylines = extract_lane_polylines(pred)
-        from src.geometry.centerline import ego_centerline
-
-        centre_img = ego_centerline(polylines, target_size[0],
-                                    image_height=target_size[1])
+        ego_pair = None
+        if tracker is not None:
+            tracked = tracker.update(polylines)
+            centre_img = tracker.centerline(tracked)
+            if (tracked.left is not None and tracked.right is not None
+                    and centre_img is not None):
+                # Only over the rows the centreline survived on: a track can hold rows
+                # beyond that which the drawing guards rejected, and those are exactly
+                # the rows not worth showing.
+                lo, hi = centre_img[:, 1].min(), centre_img[:, 1].max()
+                clip = [b[(b[:, 1] >= lo) & (b[:, 1] <= hi)]
+                        for b in (tracked.left, tracked.right)]
+                if all(len(b) >= 2 for b in clip):
+                    ego_pair = tuple(clip)
+        else:
+            centre_img = ego_centerline(polylines, target_size[0],
+                                        image_height=target_size[1])
         geom = (
             road_geometry(centre_img, ground, previews)
             if centre_img is not None else None
@@ -319,7 +464,7 @@ def main(cfg: DictConfig) -> None:
         hist["offset_filt"].append(smoothed.lateral_offset_m)
         hist["kappa_filt"].append(smoothed.curvature_1pm)
         frame = _render(image, pred, polylines, centre_img, geom, ground, previews,
-                        smoothed, hist)
+                        smoothed, hist, ego_pair=ego_pair)
         bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         writer.write(bgr)
         if frames_dir is not None:
