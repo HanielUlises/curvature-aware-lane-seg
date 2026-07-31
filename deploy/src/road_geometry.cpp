@@ -140,9 +140,40 @@ RoadGeometry ReadRoadGeometry(const std::vector<Point>& ground_centerline,
   out.valid = true;
 
   // Negate the counter-clockwise convention so that right turns are positive.
-  std::vector<double> kappa = SignedCurvatureAlong(ground, num_samples);
-  for (double& k : kappa) k = -k;
-  const std::vector<Point> positions = SamplePositions(ground, num_samples);
+  // Curvature and positions come off the same spline, built once. Calling the two
+  // public helpers instead builds it twice, and the moment solve is the expensive part
+  // of the whole downstream chain.
+  const internal::Spline spline = internal::BuildSpline(ground);
+  std::vector<double> kappa;
+  std::vector<Point> positions;
+  if (spline.valid && num_samples >= 1) {
+    const int n = static_cast<int>(spline.pts.size());
+    kappa.resize(static_cast<std::size_t>(num_samples));
+    positions.resize(static_cast<std::size_t>(num_samples));
+    int seg = 0;
+    for (int i = 0; i < num_samples; ++i) {
+      const std::size_t k = static_cast<std::size_t>(i);
+      const double uu = internal::UniformParameter(i, num_samples);
+      while (seg < n - 2 && uu > spline.u[seg + 1]) ++seg;
+      const internal::Deriv dx = internal::EvalSegment(
+          uu, spline.u[seg], spline.u[seg + 1], spline.pts[seg].x,
+          spline.pts[seg + 1].x, spline.mx[seg], spline.mx[seg + 1]);
+      const internal::Deriv dy = internal::EvalSegment(
+          uu, spline.u[seg], spline.u[seg + 1], spline.pts[seg].y,
+          spline.pts[seg + 1].y, spline.my[seg], spline.my[seg + 1]);
+      const double speed_sq =
+          std::max(dx.d1 * dx.d1 + dy.d1 * dy.d1, internal::kSpeedEps);
+      // Negated so that right turns are positive, as the controller expects.
+      kappa[k] = -(dx.d1 * dy.d2 - dy.d1 * dx.d2) / std::pow(speed_sq, 1.5);
+      positions[k] = {
+          internal::EvalSegmentValue(uu, spline.u[seg], spline.u[seg + 1],
+                                     spline.pts[seg].x, spline.pts[seg + 1].x,
+                                     spline.mx[seg], spline.mx[seg + 1]),
+          internal::EvalSegmentValue(uu, spline.u[seg], spline.u[seg + 1],
+                                     spline.pts[seg].y, spline.pts[seg + 1].y,
+                                     spline.my[seg], spline.my[seg + 1])};
+    }
+  }
   if (kappa.empty() || positions.size() != kappa.size()) return out;
 
   out.curvature_1pm = Median(kappa);

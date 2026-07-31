@@ -561,8 +561,15 @@ faster, which leaves a 20 Hz control loop spending a tenth of a per cent of its 
 geometry. Most of that came from labelling connected components over horizontal runs rather
 than over pixels, the mask being mostly background.
 
-What remains is integration rather than new components: running the filter and controller
-over recorded sequences to measure closed-loop behaviour against real perception noise
-instead of the simulated plant, and porting the controller. Extending the metric evaluation
-onto TuSimple, where the units are physical, would let the control errors be quoted in real
-metres rather than as relative comparisons.
+The filter and the controller are now ported too, so the whole chain runs on the
+deployment target: a mask goes in and a steering command comes out with no Python on the
+path, at about 157 microseconds per frame, which is three tenths of a per cent of a 20 Hz
+control budget. The controller's fixtures pin nine solves spanning both turn directions,
+and the port is additionally held to the closed-form Ackermann steer, which no regenerated
+fixture could satisfy by accident.
+
+What remains is not new components but closed-loop evidence: running the filter and
+controller over recorded sequences to measure behaviour against real perception noise
+rather than the simulated plant. Extending the metric evaluation onto TuSimple, where the
+units are physical, would let the control errors be quoted in real metres rather than as
+relative comparisons.

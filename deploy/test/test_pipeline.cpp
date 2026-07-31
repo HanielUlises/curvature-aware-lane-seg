@@ -5,6 +5,9 @@
 
 #include "curvature_port/centerline.hpp"
 #include "curvature_port/lane_tracker.hpp"
+#include "curvature_port/mpc.hpp"
+#include "curvature_port/road_geometry.hpp"
+#include "curvature_port/temporal.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -90,6 +93,11 @@ int main(int argc, char** argv) {
 
   curvature_port::EgoBoundaryTracker tracker(seq.width, seq.height);
   curvature_port::DecompositionScratch scratch;
+  // The rest of the chain, so this also exercises mask to steering command end to end.
+  curvature_port::RoadGeometryFilter filter;
+  curvature_port::KinematicLateralMPC mpc;
+  int steered = 0;
+  double chain_us = 0.0;
 
   int failures = 0, compared = 0, detected = 0, poly_mismatch = 0;
   double worst = 0.0;
@@ -115,6 +123,33 @@ int main(int argc, char** argv) {
     const double us = us_mask + us_track;
     total_us += us;
     worst_us = std::max(worst_us, us);
+
+    // Everything downstream of the tracker: project, read the geometry, filter it, and
+    // solve for a steering command. Timed together as the per-frame on-vehicle cost.
+    {
+      const auto t3 = std::chrono::steady_clock::now();
+      bool have = false;
+      double off = 0.0, head = 0.0, kap = 0.0;
+      if (ok) {
+        // An identity ground plane keeps this test free of a calibration fixture; the
+        // projection itself is pinned by the geometry suite.
+        const auto rg = curvature_port::ReadRoadGeometry(tracker.centerline(),
+                                                         {5.0, 10.0, 20.0});
+        if (rg.valid) {
+          have = true;
+          off = rg.lateral_offset_m;
+          head = rg.heading_error_rad;
+          kap = rg.curvature_1pm;
+        }
+      }
+      const auto filtered = filter.Update(have, off, head, kap);
+      const auto sol = mpc.SteerForGeometry(filtered.lateral_offset_m,
+                                            filtered.heading_error_rad,
+                                            filtered.curvature_1pm, 15.0);
+      if (sol.valid && std::isfinite(sol.steer_rad)) ++steered;
+      const auto t4 = std::chrono::steady_clock::now();
+      chain_us += std::chrono::duration<double, std::micro>(t4 - t3).count();
+    }
 
     if (static_cast<int>(polylines.size()) != f.num_polylines) ++poly_mismatch;
 
@@ -165,6 +200,9 @@ int main(int argc, char** argv) {
             << "worst point disagreement " << worst << " px (tolerance "
             << seq.tolerance << ")\n"
             << "polyline-count mismatches: " << poly_mismatch << "\n"
+            << "steering command produced on " << steered << " of "
+            << seq.frames.size() << " frames\n"
+            << "geometry + filter + MPC: " << (chain_us / n) << " us/frame\n"
             << "mask decomposition " << (mask_us / n) << " us/frame, tracking "
             << (track_us / n) << " us/frame, total " << (total_us / n)
             << " us/frame mean, " << worst_us << " us worst\n";

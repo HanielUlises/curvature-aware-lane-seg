@@ -29,7 +29,7 @@ endif()
 
 add_library(curvature_port src/spline.cpp src/curvature.cpp src/ipm.cpp
                            src/road_geometry.cpp src/centerline.cpp
-                           src/lane_tracker.cpp)
+                           src/lane_tracker.cpp src/temporal.cpp src/mpc.cpp)
 target_include_directories(curvature_port PUBLIC include PRIVATE src)
 if(TARGET Eigen3::Eigen)
   target_link_libraries(curvature_port PUBLIC Eigen3::Eigen)
@@ -56,3 +56,9 @@ target_link_libraries(test_pipeline PRIVATE curvature_port)
 target_compile_definitions(test_pipeline PRIVATE
                            GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/golden")
 add_test(NAME pipeline_golden COMMAND test_pipeline)
+
+add_executable(test_control test/test_control.cpp)
+target_link_libraries(test_control PRIVATE curvature_port)
+target_compile_definitions(test_control PRIVATE
+                           GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/golden")
+add_test(NAME control_golden COMMAND test_control)

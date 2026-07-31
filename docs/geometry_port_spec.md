@@ -5,12 +5,12 @@ on-vehicle, in C++ rather than Python. This document is the **numerical contract
 C++ port of the geometry module must satisfy, so that the port is a verified
 transcription rather than a reimplementation trusted by eye.
 
-It specifies the whole perception-to-geometry chain: **curvature** (sections 3 to 6),
-the **inverse-perspective projection** (section 7), the metric **road-geometry read-out**
-the controller consumes (section 8), the **mask decomposition** that starts the chain
-(section 9), and the **boundary tracker** that gives it temporal identity (section 10).
-Each is held to the same contract-plus-golden-vectors pattern. The controller itself is
-not yet ported.
+It specifies the whole chain, from the segmenter's mask to a steering command:
+**curvature** (sections 3 to 6), the **inverse-perspective projection** (section 7), the
+metric **road-geometry read-out** (section 8), the **mask decomposition** that starts the
+chain (section 9), the **boundary tracker** that gives it temporal identity (section 10),
+the **temporal filter** (section 11), and the **controller** itself (section 12). Each is
+held to the same contract-plus-golden-vectors pattern.
 
 ## 1. Rationale
 
@@ -30,6 +30,8 @@ numerically against shared golden vectors.
 | Road geometry | [FITPACK-backed read-out](../src/geometry/road_geometry.py) | [Portable read-out](../src/geometry/road_geometry_portable.py) | [Eigen read-out](../deploy/src/road_geometry.cpp) |
 | Mask decomposition | [OpenCV components](../src/geometry/centerline.py) | same module (no library gap) | [Run-based labelling](../deploy/src/centerline.cpp) |
 | Boundary tracking | [Tracker](../src/geometry/lane_tracker.py) | same module | [Tracker](../deploy/src/lane_tracker.cpp) |
+| Temporal filter | [Kalman filters](../src/geometry/temporal.py) | same module | [Kalman filters](../deploy/src/temporal.cpp) |
+| Controller | [Lateral MPC](../src/control/mpc.py) | same module | [Lateral MPC](../deploy/src/mpc.cpp) |
 
 The curvature stage is the only one with a library gap. The projection is a small SVD
 with the same mathematics on both sides, so the port is held to floating-point
@@ -335,3 +337,71 @@ reach the extent cutoff and decide whether a row falls inside it. And the sidewa
 guard is computed over every row including the undefined ones, so that the row following a
 gap has an infinite step and is dropped, rather than being skipped and given a step of
 zero.
+
+## 11. Temporal filter
+
+Each of the three control quantities is tracked by a scalar Kalman filter over
+$[\text{value}, \text{rate}]$ with a constant-rate model. Over a step $\Delta t$,
+
+```math
+A = \begin{bmatrix} 1 & \Delta t \\ 0 & 1 \end{bmatrix},
+\qquad
+Q = \sigma_a^2 \begin{bmatrix} \Delta t^3/3 & \Delta t^2/2 \\ \Delta t^2/2 & \Delta t \end{bmatrix},
+```
+
+the standard discretization of continuous white-noise acceleration. Three behaviours are
+part of the contract, and all three are stateful, so a port is validated over a **sequence**
+rather than a step: a single-frame fixture agrees with anything.
+
+1. **Seeding.** The first measurement sets the state directly rather than being blended up
+   from zero, with $P = \mathrm{diag}(\sigma_m^2, \sigma_a^2)$.
+2. **Gating.** A measurement whose residual exceeds $g\sqrt{P_{00} + \sigma_m^2}$ is
+   rejected, with $g = 4$ by default. The state still advances on the motion model, so a
+   rejected frame is not a frozen frame.
+3. **Coasting.** A frame with no geometry predicts forward and increments a counter. The
+   counter resets only when the **offset** is accepted, that being the quantity the
+   controller is most sensitive to; heading or curvature being gated does not reset it.
+
+**Tolerance.** $10^{-9}$ relative against the reference on all three values, with exact
+agreement on the measured, accepted and coasting flags, over a 40-step sequence containing
+three dropouts, one gross outlier and a lane change.
+
+## 12. Controller
+
+Linearized lateral error dynamics of a kinematic bicycle at speed $v$ with wheelbase $L$,
+forward-Euler discretized:
+
+```math
+x_{k+1} = A x_k + B u_k + d_k, \quad
+A = \begin{bmatrix} 1 & v\,\Delta t \\ 0 & 1 \end{bmatrix}, \;
+B = \begin{bmatrix} 0 \\ v\,\Delta t / L \end{bmatrix}, \;
+d_k = \begin{bmatrix} 0 \\ -v\,\Delta t\,\kappa_k \end{bmatrix}.
+```
+
+Stacking the horizon gives $X = S_x x_0 + S_u U + S_d D$, and the quadratic cost makes the
+input sequence the solution of an unconstrained least-squares problem,
+
+```math
+U^\star = -\left( S_u^\top \bar{Q} S_u + \bar{R} \right)^{-1} S_u^\top \bar{Q}
+          \left( S_x x_0 + S_d D \right),
+```
+
+re-solved every step on the current state. The first element is the command; the steering
+limit is applied by saturation, so it is respected at the plant but not inside the
+optimization.
+
+**Sign conventions.** Internally cross-track is positive left of the path and steering
+positive to the left; the perception stack reports right-positive. The mapping is
+$e = \text{offset}$, $\psi = \text{heading}$, $\kappa \to -\kappa$, with the returned
+steer negated back. A port that omits the negation produces a controller that steers
+confidently into the ditch, which no tolerance would catch, so the fixtures include both
+left and right curves.
+
+**Tolerance.** $10^{-9}$ relative on the command and on the unsaturated command, with
+exact agreement on the saturation flag, across nine cases spanning offsets, headings,
+curvatures of both signs, speeds from 5 to 30 m/s, and a deliberately saturating state.
+
+**Closed-form anchor.** On a constant-curvature path with no tracking error the steady-state
+steer is the Ackermann value $\delta = L\kappa$. This holds independently of the fixtures
+and is asserted directly at four curvatures, so a port that regenerated the vectors from
+its own output is still caught.

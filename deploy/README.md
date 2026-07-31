@@ -14,25 +14,30 @@ numerical contract in [docs/geometry_port_spec.md](../docs/geometry_port_spec.md
 | Road geometry | [road_geometry.hpp](include/curvature_port/road_geometry.hpp) | [road_geometry_portable.py](../src/geometry/road_geometry_portable.py) |
 | Mask decomposition | [centerline.hpp](include/curvature_port/centerline.hpp) | [centerline.py](../src/geometry/centerline.py) |
 | Boundary tracking | [lane_tracker.hpp](include/curvature_port/lane_tracker.hpp) | [lane_tracker.py](../src/geometry/lane_tracker.py) |
+| Temporal filter | [temporal.hpp](include/curvature_port/temporal.hpp) | [temporal.py](../src/geometry/temporal.py) |
+| Controller | [mpc.hpp](include/curvature_port/mpc.hpp) | [mpc.py](../src/control/mpc.py) |
 
 The shared cubic-spline kernel is internal (`src/spline_internal.hpp`); deployment code
-includes the three public headers only.
+includes the public headers only.
 
-Not ported: the temporal filter and the controller itself.
+The chain is complete: a mask goes in, a steering command comes out, with no Python on
+the path.
 
 ## Performance
 
-The whole mask-to-centreline path, which is what runs per frame on the vehicle, takes
-**59 microseconds** per 512x288 frame on a desktop x86 core: 38 for the mask, 21 for the
-tracker. The Python reference does the same work in 5,327 microseconds, so the port is
-about 90 times faster, and a 20 Hz control loop spends roughly a tenth of a per cent of
-its budget here.
+The whole per-frame path takes about **157 microseconds** per 512x288 frame on a desktop
+x86 core: 38 for the mask decomposition, 22 for the tracker, and 97 for the projection,
+road-geometry read-out, filter and MPC together. A 20 Hz control loop spends about three
+tenths of a per cent of its budget here. The Python reference needs 5,327 microseconds for
+the mask and tracker alone, so that part of the port is roughly 90 times faster.
 
-Two changes account for most of that. Components are labelled over horizontal runs
+Three changes account for most of that. Components are labelled over horizontal runs
 rather than pixels, which took the mask stage from 335 to 108 microseconds, and the
 background between runs is skipped a machine word at a time, which took it to 38. The
-tracker's buffers are allocated once at construction, so the per-frame path allocates
-nothing.
+tracker's buffers are allocated once at construction, so its per-frame path allocates
+nothing. And the road-geometry read-out builds its spline once for both curvature and
+positions rather than once for each, which halved the downstream cost from 165 to 97
+microseconds; the moment solve dominates everything after the mask.
 
 The release build is `-O3 -DNDEBUG`. `-march=native` is available behind
 `-DCURVATURE_PORT_NATIVE=ON` but off by default, since a binary tuned for the building
@@ -49,13 +54,15 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-Three suites run: `curvature_golden`, `geometry_golden` and `pipeline_golden`. All read
+Four suites run: `curvature_golden`, `geometry_golden`, `pipeline_golden` and
+`control_golden`. All read
 fixtures from `test/golden/`, generated on the Python side:
 
 ```
 python -m scripts.export_golden_vectors      # curvature
 python -m scripts.export_geometry_vectors    # projection and road geometry
 python -m scripts.export_pipeline_vectors infer.source=<clip-dir>   # mask to centreline
+python -m scripts.export_control_vectors                           # filter and MPC
 ```
 
 The pipeline fixture is a run of real predicted masks, run-length encoded, with the
