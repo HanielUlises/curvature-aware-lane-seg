@@ -20,3 +20,11 @@ max_frames: null    # cap total frames (null = all); e.g. 300 for a ~30s montage
 # Also write each composed frame as PNG (scripts.viz_control). Build GIFs from these
 # rather than from the mp4, so the result does not carry the video codec's artifacts.
 dump_frames: false
+# Track the ego lane's two boundaries across frames instead of re-deriving them from
+# each mask independently (scripts.viz_control). Only meaningful on a genuinely
+# consecutive sequence; leave it off for the curvature-ordered montage, whose frames
+# come from unrelated scenes.
+track_ego_lane: true
+track_alpha: 0.60        # weight on the new observation; lower is steadier but drifts
+track_gate_px: 80.0      # displacement beyond which a boundary is a different one
+track_max_coast: 1       # frames a row may be carried with no observation
