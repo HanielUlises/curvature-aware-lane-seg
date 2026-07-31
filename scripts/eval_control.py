@@ -154,7 +154,10 @@ def main(cfg: DictConfig) -> None:
                 cfg.data.sky_frac, cv2.INTER_AREA,
             )
             logits = model(transform(image=image)["image"].unsqueeze(0).to(device))
-            pred = (torch.sigmoid(logits)[0, 0].cpu().numpy() >= 0.5).astype(np.uint8)
+            threshold = float(cfg.infer.get("threshold", 0.5))
+            pred = (torch.sigmoid(logits)[0, 0].cpu().numpy() >= threshold).astype(
+                np.uint8
+            )
 
             pred_geom = road_geometry_from_mask(pred, ground, previews)
             if pred_geom is None:
