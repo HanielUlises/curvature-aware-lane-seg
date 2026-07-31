@@ -5,11 +5,12 @@ on-vehicle, in C++ rather than Python. This document is the **numerical contract
 C++ port of the geometry module must satisfy, so that the port is a verified
 transcription rather than a reimplementation trusted by eye.
 
-It specifies three stages of the perception-to-control chain: **curvature**
-(sections 3 to 6), the **inverse-perspective projection** (section 7), and the metric
-**road-geometry read-out** the controller consumes (section 8). Each is held to the
-same contract-plus-golden-vectors pattern. The lane-mask decomposition that precedes
-them and the controller itself are not yet ported.
+It specifies the whole perception-to-geometry chain: **curvature** (sections 3 to 6),
+the **inverse-perspective projection** (section 7), the metric **road-geometry read-out**
+the controller consumes (section 8), the **mask decomposition** that starts the chain
+(section 9), and the **boundary tracker** that gives it temporal identity (section 10).
+Each is held to the same contract-plus-golden-vectors pattern. The controller itself is
+not yet ported.
 
 ## 1. Rationale
 
@@ -27,6 +28,8 @@ numerically against shared golden vectors.
 | Curvature | [FITPACK smoothing spline](../src/geometry/curvature.py) | [Cubic spline, pure NumPy](../src/geometry/curvature_portable.py) | [Cubic spline, Eigen](../deploy/src/curvature.cpp) |
 | Projection | [DLT homography](../src/geometry/ipm.py) | same module (no library gap) | [DLT homography, Eigen](../deploy/src/ipm.cpp) |
 | Road geometry | [FITPACK-backed read-out](../src/geometry/road_geometry.py) | [Portable read-out](../src/geometry/road_geometry_portable.py) | [Eigen read-out](../deploy/src/road_geometry.cpp) |
+| Mask decomposition | [OpenCV components](../src/geometry/centerline.py) | same module (no library gap) | [Run-based labelling](../deploy/src/centerline.cpp) |
+| Boundary tracking | [Tracker](../src/geometry/lane_tracker.py) | same module | [Tracker](../deploy/src/lane_tracker.cpp) |
 
 The curvature stage is the only one with a library gap. The projection is a small SVD
 with the same mathematics on both sides, so the port is held to floating-point
@@ -259,3 +262,76 @@ with $\mathrm{NaN}$ required to match $\mathrm{NaN}$ exactly. The closed-form an
 are a straight lane ($e_\psi = 0$, $\kappa = 0$), a lane at constant slope
 ($e_\psi = \arctan m$ exactly), and a circular arc of radius $R$ ($\kappa = \pm 1/R$ at
 every preview distance, sign following the turn direction).
+
+## 9. Mask decomposition
+
+The segmenter's binary mask becomes one polyline per lane. Each 8-connected component is
+collapsed to its row-wise centroid: for every image row the component occupies, the mean
+column of its foreground pixels is one point. Components spanning fewer than 8 rows or
+carrying fewer than 40 pixels are discarded as specks. The polylines are ordered
+left to right by the column of their bottom-most point.
+
+**9.1 Labelling.** A port need not reproduce OpenCV's label numbering, only its partition
+of the foreground; the ordering above is what makes the output canonical. The reference
+implementation in this port labels **horizontal runs** rather than pixels. Two runs on
+adjacent rows are 8-connected when
+
+```math
+a_{x_0} \le b_{x_1} \ \wedge\  b_{x_0} \le a_{x_1}
+```
+
+for half-open spans $[x_0, x_1)$, which is an overlap test after widening one span by a
+pixel. Since both rows are sorted by column this is a two-pointer merge, and the row-wise
+centroid a lane polyline needs has a closed form over a run,
+
+```math
+\sum_{x \in [x_0, x_1)} x = \tfrac{1}{2}\,(x_0 + x_1 - 1)(x_1 - x_0),
+```
+
+so no pass over individual pixels is required at all. Measured on 512×288 frames this is
+the difference between 335 and 38 microseconds, and the mask stage otherwise dominates
+the cost of the entire chain.
+
+**9.2 Ego centreline.** The two polylines bracketing the camera axis, nearest on each
+side by bottom-most column, are resampled onto a common grid of image rows running from
+the further of their two far ends down to the nearer end plus a bounded extension, capped
+at the frame edge. Each boundary may be extended at most 45 rows past what it covers,
+along a line fitted to that end's last 25 rows. The centreline is the midpoint where both
+are defined.
+
+## 10. Boundary tracking
+
+The tracker holds one column profile per boundary over a fixed row grid and carries it
+between frames. Its full state, defaults and rationale are in
+[the reference implementation](../src/geometry/lane_tracker.py); a port must reproduce
+five behaviours, each of which cost a real defect to establish:
+
+1. **Association before averaging.** Each boundary is matched to the one the track was
+   already following, by median column distance over shared rows, subject to a gate.
+   Re-choosing the pair per frame by proximity to the camera axis lets the next marking
+   out take the place of a lost one, moving the centreline by half a lane.
+2. **Ordering.** The matched left must lie left of the matched right. A gate alone lets
+   the right track match the left boundary when the two are close.
+3. **Width plausibility, row by row.** Expected lane width in pixels varies steeply with
+   row, from about 105 px at row 60 to 377 px at row 180 on this camera, so a pair is
+   compared against the width *profile* being tracked, never against a scalar.
+4. **Guards on the drawn line.** Reject where the boundaries have crossed; break where
+   the midpoint steps sideways faster than three times its own typical bend; keep only
+   the longest contiguous run.
+5. **Extent as a median.** The near end is the median of the last three frames, clipped
+   to what the current frame supports, and applied **only when it leaves at least three
+   points**. Applying it unconditionally erases the line on frames where the median falls
+   before the run begins.
+
+**Tolerances.** Validated over a recorded sequence of real predicted masks rather than
+synthetic input, since the stage is stateful and its failure modes only appear over time.
+Across 1200 consecutive frames the port and the reference agree on every frame that
+yields a centreline, on the number of points in it, and on each point to within
+$1.3 \times 10^{-11}$ px.
+
+Two numerical details are load-bearing at that tolerance. Row grids must be built the way
+`numpy.linspace` builds them, step first with the endpoint pinned, because the last bits
+reach the extent cutoff and decide whether a row falls inside it. And the sideways-step
+guard is computed over every row including the undefined ones, so that the row following a
+gap has an infinite step and is dropped, rather than being skipped and given a step of
+zero.

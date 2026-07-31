@@ -204,12 +204,18 @@ are the ones that later cost an ego-lane detection.
   <img src="docs/assets/control_demo.gif" alt="Perception to control chain on TuSimple footage" width="820">
 </p>
 
-<p align="center"><em>Top left: predicted lane mask (red), lane polylines recovered from it
-(cyan), and the ego centreline (yellow). Top right: the same geometry after the calibrated
-ground projection, on a metric grid, with the quantities the controller consumes; crosses
-mark the 5, 10 and 20 m preview distances. Bottom: raw per-frame estimates in grey against
-the temporally filtered signal in green. Five seconds of continuous held-out TuSimple
-footage at 20 Hz, 99 of 100 frames yielding an ego lane.</em></p>
+<p align="center"><em>Top left: predicted lane mask (red), the tracked boundaries of the ego
+lane (cyan), and the centreline between them (yellow), each marked at its sampled points
+rather than drawn as a solid stroke, since a finite set of samples is what the estimate
+actually is; components outside the ego lane are left to the mask rather than traced, since
+they carry nothing the mask does not already show. Top right: the same geometry after the calibrated ground projection, on a metric grid,
+with the quantities the controller consumes; crosses mark the 5, 10 and 20 m preview
+distances. Bottom: raw per-frame estimates in grey against the temporally filtered signal in
+green. Three seconds of continuous held-out TuSimple footage at 20 Hz; the centreline moves
+1.2 px per frame at a fixed image row, and four frames report no ego lane rather than one
+the tracker could not stand behind. The clip is the strongest unbroken stretch in the longest consecutive run
+available in the split, chosen deliberately: it shows the chain working, not its average
+case, which the tables below give instead.</em></p>
 
 This is the whole chain in one view: mask, then polylines, then centreline, then metric
 ground geometry, then the three control inputs. It also serves as a visual check on the
@@ -268,26 +274,89 @@ over the rows the two boundaries happened to share and one short boundary trunca
 Resampling both boundaries onto a common row grid, each extended by at most 45 rows past
 what it covers, cut that to 2.25 m and brought the near end from 17.5 m to 8.1 m.
 
-| | original | after fit | after fit and extent | filtered |
+The third cause was the one the first two exposed: **the boundaries carried no identity
+between frames**. Each mask was decomposed independently, and the lane count changed on 71
+of 99 transitions, so the pair being averaged was often not the pair from the frame before.
+The downstream filter cannot repair that, since it sees a boundary swap and a real
+displacement as the same jump in offset. Tracking the two boundaries across frames, with an
+exponential average on their columns and an association gate that resets on a genuine
+change, addresses it at the stage where the identity lives.
+
+| | original | after fit | after fit and extent | tracked |
 |---|---|---|---|---|
-| offset jitter | 0.779 m | 0.427 m | 0.366 m | **0.120 m** |
-| heading jitter | 3.48° | 1.63° | 1.27° | **0.46°** |
-| near-end depth wander | 8.9 m | 8.9 m | **2.25 m** | n/a |
+| offset jitter | 0.779 m | 0.427 m | 0.366 m | **0.129 m** |
+| heading jitter | 3.48° | 1.63° | 1.25° | **0.87°** |
+| lateral movement at a fixed row | n/a | n/a | 25.3 px | **4.2 px** |
+| near-end row wander | n/a | n/a | 32.3 px | **11.4 px** |
+| centreline length | n/a | n/a | 109 rows | **132 rows** |
+| frames yielding an ego lane | n/a | n/a | 97/100 | 93/100 |
+
+*Over a 100-frame consecutive TuSimple run at 20 fps. Two columns go the other way. The
+tracked line sits a mean 9.4 px from the midpoint of the boundaries observed in the same
+frame, though that reference is itself contaminated by the mis-association described below;
+and it reports an ego lane on four fewer frames, having refused pairs it could not
+associate rather than accepting whatever bracketed the camera axis.*
+
+The first version of this tracker was **worse than no tracker**, and the way it failed is
+worth recording. It carried unobserved rows for up to eight frames, which made every
+stability number improve sharply: the drawn line moved half as far per frame and the
+centreline grew 50% longer. It was also wrong. On a frame where the segmenter saw the right
+boundary over 33 image rows, the tracker drew 200 rows of it from columns measured up to
+0.4 s earlier, and the lateral offset read −2.1 m where the untracked estimate read −0.5 m.
+Stability had been optimized directly, and a line frozen at a stale position is perfectly
+stable. The measurement that caught it was deviation from the boundaries observed in the
+same frame, which no amount of smoothing can improve.
+
+**The largest single defect was in which boundaries were being averaged at all.** The ego
+pair was re-chosen every frame as whichever detections sat nearest the camera axis. When the
+segmenter loses the ego lane's own marking, the next marking out wins instead, and being
+roughly a lane further away it drags the centreline sideways by half a lane until the real
+marking returns. On the demo clip that rule moved a chosen boundary by more than 90 px on
+four of sixty frames, and the implied lane width ranged from 144 to 310 px. The tracker now
+associates each boundary with the one it was already following, gated on displacement,
+ordered so the pair stays a pair, and checked against the width profile it has been
+tracking, which is compared row by row because lane width in pixels grows steeply towards
+the vehicle. Where nothing associates, the bracketing rule still supplies that side, so a
+late track is not starved; what the gate stops is silently swapping in a boundary a lane
+away. This is what took offset jitter from 0.366 m to 0.129 m and lateral movement from
+25 px per frame to 4.
+
+Alongside it, the tracker coasts a row for a single frame, refuses to draw where the two
+tracked boundaries have crossed or where the midpoint steps sideways much faster than it has
+been, smooths each boundary along its own length, declines to report a centreline shorter
+than 25 rows, and takes the drawn extent as a median over the last three frames. That last one matters more than it sounds: what moves between frames is
+not the line's position, which shifts a couple of pixels, but its **extent**, which jumped a
+mean of 32 image rows as the mask found and lost the near field. A median rejects the
+one-frame spikes without lagging steady evidence; a growth rate limit was tried first and
+rejected, because it left the drawn line trailing the available geometry by 30 to 50 rows
+permanently, having no mechanism to catch up. The extent is always clipped to what the
+current frame supports, so retraction stays immediate and the line never outruns the mask.
+What the tracker does not do is improve heading, which comes out slightly worse.
+
+Separately, the centreline is drawn as an anti-aliased line rather than a row of opaque
+squares, and its opacity now falls off both towards its own near end and across a fixed band
+of image rows. The band has to sit where the lines actually end, which is a mean row of 136
+here; set beyond that it never engages and the bright end flickers with the detection anyway,
+which is what the first attempt did. Rendered untracked frames with the new drawing are hard
+to tell from tracked ones, so most of the visible improvement in the clip above is this
+change rather than the tracker. What the tracker adds visually is continuity across frames
+where detection drops out entirely.
 
 One thing that was tried and rejected: drawing the centreline reconstructed from the
 filtered state rather than the raw one. Measured at 10 m ahead it was 7.7 times *less*
 steady than the raw line, because rebuilding a curve from three filtered scalars amplifies
 heading and curvature noise quadratically with distance. Reverted.
 
-Curvature is untouched by either fix, since it comes from the spline rather than the
-near-field line, and it remains the weakest signal: raw curvature still flips sign on 48 of
-98 frame transitions, carrying almost no information about which way the road bends until
-filtered. Association is also still imperfect, with the lane count changing on 71 of 99
-transitions as the mask fires on barriers and reflective strips. The drawn end still moves
-by about 32 px per frame, since bounded extension cannot invent the 200 rows that would be
-needed to pin it to the frame edge. And 0.12 m of filtered offset variation per frame is
-still more than a controller should track. The geometry is markedly better than it was and
-still not good enough to drive on.
+Curvature is untouched by the estimator fixes, since it comes from the spline rather than
+the near-field line, and it remains the weakest signal: raw curvature flips sign on 48 of 98
+frame transitions, carrying almost no information about which way the road bends until it is
+tracked or filtered. What the tracker does not fix is the mask underneath it: the lane count
+still changes on most transitions as the segmenter fires on barriers and reflective strips,
+and the tracker only stops that from reaching the centreline. It buys detection continuity
+too, with all 100 frames of the run yielding an ego lane against 99 untracked, but that is a
+bounded coast over a short gap, not a detection the model made. And roughly 0.12 m of offset
+variation per frame is still more than a controller should track. The geometry is markedly
+better than it was and still not good enough to drive on.
 
 ## Roadmap toward the controller
 
@@ -298,27 +367,36 @@ order:
 1. **Centerline extraction.** Reduce the binary mask to ordered lane points and a drivable
    centerline (skeletonize or column-wise peak-picking, then associate points into lanes).
    This turns pixels into the polylines the geometry module already expects.
-2. **Ground-plane projection (IPM).** Apply an inverse-perspective homography from camera
+2. **Boundary tracking.** Give the ego lane's two boundaries an identity across frames
+   before anything is measured from them, since the mask is decomposed independently per
+   frame and the pair being averaged is often not the pair from the frame before. An
+   exponential average on the boundary columns, an association gate that resets on a real
+   change rather than blending through it, and a one-frame coast for rows the current frame
+   lost. The gain is modest and one column of it is slightly negative; the section above has
+   the measurements and the account of how an earlier, more aggressive version of this stage
+   made every stability number look excellent while drawing the lane where no evidence
+   supported it.
+3. **Ground-plane projection (IPM).** Apply an inverse-perspective homography from camera
    calibration to map lane points into a metric bird's-eye view. This removes the
    perspective inflation of curvature near the vanishing point, which is the known
    limitation of image-space κ set out in the
    [geometry port specification](docs/geometry_port_spec.md).
-3. **Geometry in BEV.** Fit the arclength spline in ground coordinates and read off
+4. **Geometry in BEV.** Fit the arclength spline in ground coordinates and read off
    curvature κ(s) and lateral offset. The estimator already exists in the geometry module,
    with a portable NumPy reference and a validated C++ port in the deployment module
    against shared golden vectors.
-4. **Control-relevant evaluation.** Replace, or at least augment, IoU with the errors the
+5. **Control-relevant evaluation.** Replace, or at least augment, IoU with the errors the
    MPC consumes: lateral offset error and curvature error at fixed preview distances. This
    makes the top-line thesis measurable, since a model can win on IoU and still misplace
    the centerline the controller tracks. Implemented; see the control-error section above.
-5. **Temporal stability.** A constant-velocity Kalman filter per quantity, so the command
+6. **Temporal stability.** A constant-velocity Kalman filter per quantity, so the command
    is smooth rather than re-estimated independently each frame. It also answers the
    detection-failure finding directly: a frame with no ego lane advances on the motion
    model instead of returning nothing, and the filter reports how long it has been
    coasting so a supervisor can hand over before the extrapolation is trusted too far.
    Measurements far outside the predicted distribution are gated out, which stops one
    badly placed centreline from stepping the steering.
-6. **Kinematic MPC.** Linearized lateral error dynamics of a kinematic bicycle, with
+7. **Kinematic MPC.** Linearized lateral error dynamics of a kinematic bicycle, with
    previewed curvature entering as a known disturbance so a curve is handled by
    feedforward rather than by letting error build. Stacking the horizon makes the solve a
    closed-form least-squares problem, re-solved every step, with the steering limit applied
@@ -327,15 +405,31 @@ order:
    `delta = L * kappa`, and in closed-loop simulation it drives a 1.5 m offset to under
    2 cm and holds a constant curve to under 5 cm.
 
-All six steps are implemented and unit-tested, with step 2 calibrated from TuSimple and
-cross-validated by two independent estimators. Steps 2 and 3 are now ported to C++
+All seven steps are implemented and unit-tested, with step 3 calibrated from TuSimple and
+cross-validated by two independent estimators. Steps 1 to 4 are now ported to C++
 alongside the curvature estimator, pinned by their own golden vectors; porting them
 exposed a real defect, since the natural spline end condition the port had been using
 forces curvature to zero at the ends of a polyline and so returned 0.0032 1/m instead of
 0.02 for the 5 m preview on a 50 m arc. Not-a-knot end conditions fixed it in both
-languages. What remains is integration rather than new components: running the filter and
-controller over recorded sequences to measure closed-loop behaviour against real
-perception noise instead of the simulated plant, and porting the mask-to-centreline stage
-and the controller itself. Extending the
-metric evaluation onto TuSimple, where the units are physical, would let the control errors
-be quoted in real metres rather than as relative comparisons.
+languages.
+
+The mask decomposition and the tracker are ported too, which puts the whole
+perception-to-geometry path on the deployment target. Because that stage is stateful, it is
+validated over a sequence rather than on single frames: across **1200 consecutive frames of
+real predicted masks** the port agrees with the Python reference on every frame that yields
+a centreline, on the number of points in each, and on every point to within
+1.3e-11 px. Establishing that turned up four behaviours where the port had been subtly
+wrong in ways single-frame tests could not reach, including an extent cap that erased the
+line on frames where the reference kept it, and a row grid built slightly differently from
+`numpy.linspace` whose last bits decided whether a row fell inside the cap.
+
+It also runs at **59 microseconds per frame** against the reference's 5,327, about 90 times
+faster, which leaves a 20 Hz control loop spending a tenth of a per cent of its budget on
+geometry. Most of that came from labelling connected components over horizontal runs rather
+than over pixels, the mask being mostly background.
+
+What remains is integration rather than new components: running the filter and controller
+over recorded sequences to measure closed-loop behaviour against real perception noise
+instead of the simulated plant, and porting the controller. Extending the metric evaluation
+onto TuSimple, where the units are physical, would let the control errors be quoted in real
+metres rather than as relative comparisons.
