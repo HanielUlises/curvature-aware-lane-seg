@@ -58,3 +58,8 @@ trapezoid:
 
 # Look-ahead distances at which curvature is reported to the controller.
 preview_distances_m: [5.0, 10.0, 20.0]
+
+# Path to a calibration.json for footage from a camera other than the one calibrated in
+# the output root. The bird's-eye panel is metric, so pointing it at another camera's
+# parameters produces a confident and wrong picture rather than an obviously broken one.
+calibration_file: null

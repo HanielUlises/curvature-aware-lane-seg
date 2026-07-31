@@ -64,7 +64,10 @@ COL_TEXT = (240, 240, 245)
 
 
 def _load_calibration(cfg: DictConfig) -> CameraCalibration:
-    path = Path(cfg.paths.output_root) / "calibration.json"
+    # Footage from a different camera needs its own calibration; the bird's-eye panel is
+    # metric and silently wrong if it is given another camera's parameters.
+    override = cfg.get("ipm", {}).get("calibration_file", None)
+    path = Path(override) if override else Path(cfg.paths.output_root) / "calibration.json"
     if not path.exists():
         raise FileNotFoundError(
             f"{path} not found. Run `python -m scripts.calibrate_camera` first; the "
@@ -433,7 +436,8 @@ def main(cfg: DictConfig) -> None:
     for rgb in _frames_from_source(source, max_frames):
         rgb = _center_crop_aspect(rgb, target_size)
         image, pred = _predict(
-            model, rgb, transform, target_size, cfg.data.sky_frac, cfg.infer.tta, device
+            model, rgb, transform, target_size, cfg.data.sky_frac, cfg.infer.tta, device,
+            float(cfg.infer.get("threshold", 0.5)),
         )
         polylines = extract_lane_polylines(pred)
         ego_pair = None

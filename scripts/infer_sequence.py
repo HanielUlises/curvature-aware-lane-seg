@@ -97,14 +97,18 @@ def _frames_from_source(source: Path, max_frames=None):
 
 
 @torch.no_grad()
-def _predict(model, image_rgb, transform, target_size, sky, tta, device):
+def _predict(model, image_rgb, transform, target_size, sky, tta, device,
+             threshold: float = 0.5):
     image = preprocess_geometry(image_rgb, target_size, sky, cv2.INTER_AREA)
     x = transform(image=image)["image"].unsqueeze(0).to(device)
     prob = torch.sigmoid(model(x))
     if tta:
         pf = torch.sigmoid(model(torch.flip(x, dims=[3])))
         prob = 0.5 * (prob + torch.flip(pf, dims=[3]))
-    pred = (prob[0, 0].cpu().numpy() >= 0.5).astype(np.uint8)
+    # Thresholded here rather than downstream: a curvature-weighted model is more
+    # conservative than the baseline and sits at a different point on its operating
+    # curve, so the two are only comparable when each is given its own threshold.
+    pred = (prob[0, 0].cpu().numpy() >= threshold).astype(np.uint8)
     return image, pred
 
 
