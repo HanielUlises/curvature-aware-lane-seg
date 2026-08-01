@@ -55,6 +55,45 @@ std::vector<Point> ApplyHomography(const Matrix3& h, const std::vector<Point>& p
   return out;
 }
 
+Matrix3 CameraCalibration::IntrinsicMatrix() const {
+  Matrix3 k;
+  k << fx, 0.0, cx,
+       0.0, fy, cy,
+       0.0, 0.0, 1.0;
+  return k;
+}
+
+Matrix3 CameraCalibration::RotationMatrix() const {
+  const double cp = std::cos(pitch_rad), sp = std::sin(pitch_rad);
+  const double cy = std::cos(yaw_rad), sy = std::sin(yaw_rad);
+  Matrix3 rx, ry;
+  rx << 1.0, 0.0, 0.0,
+        0.0, cp, -sp,
+        0.0, sp, cp;
+  ry << cy, 0.0, sy,
+        0.0, 1.0, 0.0,
+        -sy, 0.0, cy;
+  return rx * ry;
+}
+
+void CameraCalibration::VanishingPoint(double* u, double* v) const {
+  if (u != nullptr) *u = cx + fx * std::tan(yaw_rad) / std::cos(pitch_rad);
+  if (v != nullptr) *v = cy - fy * std::tan(pitch_rad);
+}
+
+bool GroundPlaneFromCalibration(const CameraCalibration& calib, GroundPlane* out) {
+  if (!(calib.height_m > 0.0) || out == nullptr) return false;
+  Matrix3 m;
+  // Ground (x, z, 1) to camera coordinates: x stays lateral, z becomes depth, and the
+  // constant column carries the camera height above the road.
+  m << 1.0, 0.0, 0.0,
+       0.0, 0.0, calib.height_m,
+       0.0, 1.0, 0.0;
+  const Matrix3 ground_to_image = calib.IntrinsicMatrix() * calib.RotationMatrix() * m;
+  *out = GroundPlane(ground_to_image.inverse());
+  return true;
+}
+
 GroundPlane::GroundPlane(const Matrix3& h) : h_(h), h_inv_(h.inverse()) {}
 
 std::vector<Point> GroundPlane::ToGround(const std::vector<Point>& image_points) const {

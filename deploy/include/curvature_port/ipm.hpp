@@ -30,6 +30,28 @@ Matrix3 HomographyFromPoints(const std::vector<Point>& src,
 // floor of 1e-12 so points at the horizon do not produce infinities.
 std::vector<Point> ApplyHomography(const Matrix3& h, const std::vector<Point>& points);
 
+// Camera intrinsics and extrinsics, in the preprocessed frame's pixel coordinates.
+// Pitch is positive looking down, yaw positive to the right, height above the road.
+struct CameraCalibration {
+  double fx = 0.0, fy = 0.0, cx = 0.0, cy = 0.0;
+  double height_m = 0.0;
+  double pitch_rad = 0.0;
+  double yaw_rad = 0.0;
+
+  Matrix3 IntrinsicMatrix() const;
+  // R = Rx(pitch) Ry(yaw).
+  Matrix3 RotationMatrix() const;
+  // Image location of the road vanishing point implied by the extrinsics. A useful
+  // independent check on a calibration: it should sit near the horizon in the image.
+  void VanishingPoint(double* u, double* v) const;
+};
+
+// The exact flat-ground mapping for a calibrated camera, ground_to_image = K R M with
+// M = [[1,0,0],[0,0,h],[0,1,0]]. Without this a deployment can apply a homography but
+// cannot construct one from the camera it is actually bolted to.
+// Returns false when the height is not positive, which makes the map singular.
+bool GroundPlaneFromCalibration(const CameraCalibration& calib, class GroundPlane* out);
+
 // A configured image-to-ground mapping: image pixels (u, v) to ground metres
 // (x lateral, z ahead).
 class GroundPlane {
