@@ -37,6 +37,13 @@ else()
   target_include_directories(curvature_port PUBLIC ${EIGEN3_INCLUDE_DIR})
 endif()
 target_compile_options(curvature_port PRIVATE -Wall -Wextra)
+set_property(TARGET curvature_port PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+# Shared library with a C ABI, so Python drives the same code the vehicle runs instead of
+# carrying a second implementation of every stage.
+add_library(curvature_port_c SHARED src/c_api.cpp)
+target_link_libraries(curvature_port_c PRIVATE curvature_port)
+target_compile_options(curvature_port_c PRIVATE -Wall -Wextra)
 
 enable_testing()
 add_executable(test_curvature test/test_curvature.cpp)
@@ -62,3 +69,7 @@ target_link_libraries(test_control PRIVATE curvature_port)
 target_compile_definitions(test_control PRIVATE
                            GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/golden")
 add_test(NAME control_golden COMMAND test_control)
+
+# Deployment showcase: the whole chain over a recorded sequence, with latencies.
+add_executable(run_chain tools/run_chain.cpp)
+target_link_libraries(run_chain PRIVATE curvature_port)
