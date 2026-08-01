@@ -528,38 +528,61 @@ was not what the effort so far suggested:
 
 | | µs/frame | share |
 |---|---|---|
-| segmenter | 8,263 | 97.7% |
+| segmenter, PyTorch fp32 | 8,263 | 97.7% |
 | geometry chain (C++) | 191 | **2.3%** |
 
-Further work on the geometry would be wasted. So the segmenter was exported to ONNX
-(opset 17, 57 MB, parity verified on the thresholded mask the chain consumes rather than
-on logits) and the runtimes were benchmarked. `scripts/export_onnx.py` does both.
+At that point further work on the geometry would have been wasted, so the segmenter was exported to ONNX
+(opset 17, 57 MB) and every runtime that could consume it was measured.
+`scripts/export_onnx.py` does both. Parity is checked before any timing, on the
+**thresholded mask** the chain consumes rather than on logits, because a faster runtime
+that produces a different mask is not faster.
 
 | runtime | mean µs | p95 µs | fps | vs PyTorch | mask agreement |
 |---|---|---|---|---|---|
-| **PyTorch fp16** | **4,957** | 5,253 | 202 | **1.28×** | 99.9986% |
-| PyTorch fp32 | 6,366 | 7,452 | 157 | 1.00× | — |
-| ONNX Runtime, CUDA | 6,947 | 7,981 | 144 | 0.92× | 99.9939% |
-| ONNX Runtime, CPU | 2,147,829 | — | 0 | 0.003× | 100.0000% |
+| **ONNX Runtime, TensorRT fp16** | **1,779** | 1,837 | **562** | **3.65×** | 99.9871% |
+| PyTorch fp16 | 4,539 | 4,967 | 220 | 1.43× | 99.9986% |
+| PyTorch fp32 | 6,494 | 7,333 | 154 | 1.00× | — |
+| ONNX Runtime, CUDA | 8,052 | 9,012 | 124 | 0.81× | 99.9939% |
+| ONNX Runtime, CPU | 2,210,015 | — | 0 | 0.003× | 100.0000% |
 
-**The export did not pay, and half precision did.** ONNX Runtime on CUDA came out 8%
-*slower* than PyTorch: at batch one, a 14M-parameter U-Net gives graph-level optimization
-almost nothing to work with, and ORT's kernels do not beat cuDNN's on this shape. Half
-precision, which needs no export at all, is 1.28× for a mask that disagrees with the fp32
-one on 0.0014% of pixels. That is worth having and it is the cheapest change available.
+**TensorRT is worth 3.65×; the ONNX file on its own is worth nothing.** Handing the same
+graph to ONNX Runtime's CUDA provider is 19% *slower* than PyTorch, so the gain is not
+"exporting to ONNX" but the kernel fusion and fp16 engine that TensorRT builds from it: a
+U-Net is mostly conv/BN/ReLU chains, which is exactly what there is to fuse. Half
+precision alone, needing no export at all, gets 1.43× and is the sensible fallback
+wherever TensorRT cannot be installed.
 
-The result is recorded here rather than quietly dropped because an export is usually
-assumed to have helped, and on this model it did not. It is also worth saying what would
-change the answer: batching, a larger backbone, or an embedded target without a mature
-PyTorch build are all cases where the ONNX path becomes the sensible one, and the exported
-file is there for them.
+The mask agreement column is what makes those numbers usable. The TensorRT engine
+disagrees with fp32 on 0.013% of pixels and fp16 on 0.0014%, both far below the frame-to-
+frame variation the tracker already absorbs.
 
-TensorRT is not in the table. The provider is listed by onnxruntime but fails to
-initialize against the TensorRT build available here, and when that happens onnxruntime
-falls back to CPU and only warns. An early version of the benchmark duly reported a
-CPU timing of two seconds a frame under the heading "TensorRT fp16". The script now
-verifies that the session actually got the provider it asked for and skips it otherwise,
-on the grounds that a missing number is better than a mislabelled one.
+With the fast engine the budget looks different, and the geometry chain stops being
+negligible:
+
+| | µs/frame | share |
+|---|---|---|
+| segmenter, TensorRT fp16 | 1,779 | 90.3% |
+| geometry chain (C++) | 191 | **9.7%** |
+| total | 1,970 | 508 fps |
+
+At 2.3% the chain was not worth optimizing; at 9.7% the C++ port is what keeps the total
+near 500 fps, and a Python chain would now cost more than the network.
+
+Two practical notes, since this took three attempts to get running. The TensorRT provider
+must match the major version onnxruntime was built against, and pip's newest wheel is not
+it: onnxruntime 1.23 needed TensorRT 10.x, while `pip install tensorrt` gave 11.2, which
+loads and then fails to register. Its libraries also have to be on `LD_LIBRARY_PATH`:
+
+```
+TRT_LIBS=$(python -c "import tensorrt_libs,os;print(os.path.dirname(tensorrt_libs.__file__))")
+LD_LIBRARY_PATH="$TRT_LIBS:$LD_LIBRARY_PATH" python -m scripts.export_onnx
+```
+
+And when the provider fails, onnxruntime falls back to CPU and only warns. An early run of
+this benchmark duly reported a two-second CPU timing under the heading "TensorRT fp16",
+which is how a table like the one above ends up quietly wrong. The script now verifies the
+session actually got the provider it asked for and skips it otherwise, on the grounds that
+a missing row is better than a mislabelled one.
 
 ## Roadmap toward the controller
 
