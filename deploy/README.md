@@ -23,6 +23,35 @@ includes the public headers only.
 The chain is complete: a mask goes in, a steering command comes out, with no Python on
 the path.
 
+## Calling it from Python
+
+`libcurvature_port_c.so` exposes a C ABI (`include/curvature_port/c_api.h`) that
+[`src/native.py`](../src/native.py) drives through `ctypes`, so Python runs the same code
+the vehicle does rather than a second implementation of it:
+
+```python
+from src import native
+chain = native.NativeChain(512, 288, calibration)   # fx fy cx cy height pitch yaw
+result = chain.process(mask, speed_mps=15.0)        # -> offset, heading, curvature, steer
+```
+
+`ctypes` rather than pybind11 on purpose: no build dependency beyond the compiler the port
+already needs, and nothing to install. The cost is that everything crossing the boundary
+is plain data, which is why the result is a flat struct and polylines are copied into
+caller-owned buffers.
+
+The pure-Python implementations stay, but as the **reference the fixtures are generated
+from and the port is checked against**, not as a runtime path. That distinction is load
+bearing: if Python became a thin wrapper with nothing behind it, the golden vectors would
+be comparing the port against itself. `tests/test_native.py` exercises the reference
+directly and requires the native output to match it over a sequence.
+
+Measured over the committed 40-frame fixture: the pure-Python chain takes 16,442 us per
+frame and the native chain 178 us, a **51x** speedup. `process_into`, which reuses the
+result struct instead of building a Python object, runs at 162 us — the same as the
+standalone C++ binary, so the `ctypes` boundary itself costs nothing measurable (a
+trivial exported call is 0.22 us).
+
 ## Performance
 
 The whole per-frame path takes about **157 microseconds** per 512x288 frame on a desktop

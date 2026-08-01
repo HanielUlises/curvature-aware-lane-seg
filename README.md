@@ -568,6 +568,20 @@ control budget. The controller's fixtures pin nine solves spanning both turn dir
 and the port is additionally held to the closed-form Ackermann steer, which no regenerated
 fixture could satisfy by accident.
 
+Python now drives that library rather than duplicating it. `src/native.py` reaches the
+C++ through a C ABI and `ctypes`, so the code that runs in a notebook is the code that
+runs on the vehicle; the pure-Python implementations remain as the reference the fixtures
+are generated from and the port is checked against, which is a test role rather than a
+runtime one. Over the committed fixture the chain goes from 16,442 to 178 microseconds
+per frame, a 51-fold speedup, and `scripts/deploy_pipeline.py` runs the whole thing on
+real footage.
+
+That measurement also settled where the remaining cost is. On the KITTI drive the network
+takes 8,263 microseconds per frame and the geometry chain 191, so the chain is **2.3% of
+the budget** and further optimizing it would be wasted effort: an ONNX or TensorRT export
+of the segmenter is the only change that would move the total. Measuring the two together
+is what made that obvious.
+
 What remains is not new components but closed-loop evidence: running the filter and
 controller over recorded sequences to measure behaviour against real perception noise
 rather than the simulated plant. Extending the metric evaluation onto TuSimple, where the
