@@ -491,6 +491,76 @@ bounded coast over a short gap, not a detection the model made. And roughly 0.12
 variation per frame is still more than a controller should track. The geometry is markedly
 better than it was and still not good enough to drive on.
 
+## Deployment
+
+The chain that turns a mask into a steering command runs in C++. Python drives it through
+a C ABI rather than carrying a second implementation, so the code that runs in a notebook
+is the code that would run on the vehicle. The pure-Python stages remain as the reference
+the golden fixtures are generated from and the port is checked against, which is a test
+role rather than a runtime one: with nothing behind the wrapper, the fixtures would be
+comparing the port against itself.
+
+<p align="center">
+  <img src="docs/assets/kitti_native_demo.gif" alt="The C++ chain running on KITTI" width="760">
+</p>
+
+<p align="center"><em>The same KITTI drive, rendered from the deployed C++ chain rather
+than the Python reference. Compared frame by frame against the Python render, the camera
+panel is <strong>pixel-identical</strong>; the two differ only in the curvature-derived
+panels, because the reference reaches curvature through FITPACK while the deployment uses
+the portable spline of the port specification.</em></p>
+
+| stage | Python reference | C++ deployment | speedup |
+|---|---|---|---|
+| mask decomposition | 2,859 µs | 38 µs | 75× |
+| whole geometry chain | 16,442 µs | 178 µs | **51×** |
+
+`process_into`, which reuses the result struct instead of building a Python object, runs
+at 162 µs, the same as the standalone C++ binary, so the `ctypes` boundary itself costs
+nothing measurable: a trivial exported call is 0.22 µs. The mask stage got there by
+labelling connected components over horizontal runs rather than pixels, since a lane mask
+is a few per cent foreground, and by skipping the background a machine word at a time.
+
+### Where the time actually goes
+
+Measuring the network and the chain together settled what to optimize next, and the answer
+was not what the effort so far suggested:
+
+| | µs/frame | share |
+|---|---|---|
+| segmenter | 8,263 | 97.7% |
+| geometry chain (C++) | 191 | **2.3%** |
+
+Further work on the geometry would be wasted. So the segmenter was exported to ONNX
+(opset 17, 57 MB, parity verified on the thresholded mask the chain consumes rather than
+on logits) and the runtimes were benchmarked. `scripts/export_onnx.py` does both.
+
+| runtime | mean µs | p95 µs | fps | vs PyTorch | mask agreement |
+|---|---|---|---|---|---|
+| **PyTorch fp16** | **4,957** | 5,253 | 202 | **1.28×** | 99.9986% |
+| PyTorch fp32 | 6,366 | 7,452 | 157 | 1.00× | — |
+| ONNX Runtime, CUDA | 6,947 | 7,981 | 144 | 0.92× | 99.9939% |
+| ONNX Runtime, CPU | 2,147,829 | — | 0 | 0.003× | 100.0000% |
+
+**The export did not pay, and half precision did.** ONNX Runtime on CUDA came out 8%
+*slower* than PyTorch: at batch one, a 14M-parameter U-Net gives graph-level optimization
+almost nothing to work with, and ORT's kernels do not beat cuDNN's on this shape. Half
+precision, which needs no export at all, is 1.28× for a mask that disagrees with the fp32
+one on 0.0014% of pixels. That is worth having and it is the cheapest change available.
+
+The result is recorded here rather than quietly dropped because an export is usually
+assumed to have helped, and on this model it did not. It is also worth saying what would
+change the answer: batching, a larger backbone, or an embedded target without a mature
+PyTorch build are all cases where the ONNX path becomes the sensible one, and the exported
+file is there for them.
+
+TensorRT is not in the table. The provider is listed by onnxruntime but fails to
+initialize against the TensorRT build available here, and when that happens onnxruntime
+falls back to CPU and only warns. An early version of the benchmark duly reported a
+CPU timing of two seconds a frame under the heading "TensorRT fp16". The script now
+verifies that the session actually got the provider it asked for and skips it otherwise,
+on the grounds that a missing number is better than a mislabelled one.
+
 ## Roadmap toward the controller
 
 The segmenter produces a lane mask in the image plane. The controller needs lateral
