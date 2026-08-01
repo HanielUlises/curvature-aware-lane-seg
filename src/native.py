@@ -30,7 +30,7 @@ import numpy as np
 
 # Bump in lockstep with cp_abi_version in the shim, so a stale .so is refused rather
 # than called with a mismatched struct layout.
-REQUIRED_ABI = 1
+REQUIRED_ABI = 2
 
 _SEARCH = (
     "deploy/build/libcurvature_port_c.so",
@@ -49,6 +49,9 @@ class _FrameResult(ctypes.Structure):
         ("lateral_offset_m", ctypes.c_double),
         ("heading_error_rad", ctypes.c_double),
         ("curvature_1pm", ctypes.c_double),
+        ("raw_lateral_offset_m", ctypes.c_double),
+        ("raw_heading_error_rad", ctypes.c_double),
+        ("raw_curvature_1pm", ctypes.c_double),
         ("preview_curvature_1pm", ctypes.c_double * 3),
         ("steer_rad", ctypes.c_double),
         ("steer_unsaturated_rad", ctypes.c_double),
@@ -67,6 +70,9 @@ class FrameResult:
     lateral_offset_m: float
     heading_error_rad: float
     curvature_1pm: float
+    raw_lateral_offset_m: float
+    raw_heading_error_rad: float
+    raw_curvature_1pm: float
     preview_curvature_1pm: tuple[float, float, float]
     steer_rad: float
     steer_unsaturated_rad: float
@@ -211,6 +217,9 @@ class NativeChain:
             lateral_offset_m=r.lateral_offset_m,
             heading_error_rad=r.heading_error_rad,
             curvature_1pm=r.curvature_1pm,
+            raw_lateral_offset_m=r.raw_lateral_offset_m,
+            raw_heading_error_rad=r.raw_heading_error_rad,
+            raw_curvature_1pm=r.raw_curvature_1pm,
             preview_curvature_1pm=tuple(r.preview_curvature_1pm),
             steer_rad=r.steer_rad,
             steer_unsaturated_rad=r.steer_unsaturated_rad,

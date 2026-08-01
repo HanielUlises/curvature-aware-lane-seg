@@ -28,3 +28,7 @@ track_ego_lane: true
 track_alpha: 0.60        # weight on the new observation; lower is steadier but drifts
 track_gate_px: 80.0      # displacement beyond which a boundary is a different one
 track_max_coast: 1       # frames a row may be carried with no observation
+# Render from the deployed C++ chain instead of the Python reference (scripts.viz_control).
+# Same geometry either way; this shows what the vehicle would compute.
+native: false
+speed_mps: 15.0

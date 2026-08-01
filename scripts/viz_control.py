@@ -42,7 +42,8 @@ from src.geometry.centerline import (
 )
 from src.geometry.lane_tracker import EgoBoundaryTracker
 from src.geometry.road_geometry import DEFAULT_OFFSET_DISTANCE_M, road_geometry
-from src.geometry.temporal import RoadGeometryFilter
+from src.geometry.temporal import FilteredGeometry, RoadGeometryFilter
+from src import native
 from src.models.lane_segmenter import LaneSegmenter
 from scripts.infer_sequence import _center_crop_aspect, _frames_from_source, _predict
 from scripts.infer_video import _latest_run, _resolve_ckpt
@@ -411,8 +412,23 @@ def main(cfg: DictConfig) -> None:
     # The tracker gives the centreline frame-to-frame identity; the Kalman filter
     # downstream smooths the scalars read off it. They address different things and
     # both are reported, so the trace strip still shows what the raw read-out does.
+    # Render from the deployed C++ chain rather than the Python reference. Same
+    # geometry, and it is the code that ships, so the video shows what the vehicle
+    # would actually compute rather than a parallel implementation of it.
+    use_native = bool(cfg.infer.get("native", False))
+    chain = None
+    if use_native:
+        if not native.available():
+            raise RuntimeError(f"infer.native=true but {native.why_unavailable()}")
+        chain = native.NativeChain(
+            target_size[0], target_size[1],
+            (calib.fx, calib.fy, calib.cx, calib.cy, calib.height_m, calib.pitch_rad,
+             calib.yaw_rad),
+        )
+        print("geometry: native C++ chain")
+
     tracker = None
-    if bool(cfg.infer.get("track_ego_lane", False)):
+    if bool(cfg.infer.get("track_ego_lane", False)) and not use_native:
         tracker = EgoBoundaryTracker(
             target_size[0], target_size[1],
             alpha=float(cfg.infer.get("track_alpha", 0.45)),
@@ -441,6 +457,42 @@ def main(cfg: DictConfig) -> None:
         )
         polylines = extract_lane_polylines(pred)
         ego_pair = None
+        if chain is not None:
+            r = chain.process(pred, float(cfg.infer.get("speed_mps", 15.0)))
+            centre_img = chain.centerline() if r.has_centerline else None
+            if centre_img is not None and len(centre_img) >= 3:
+                left, right = chain.boundary("left"), chain.boundary("right")
+                lo, hi = centre_img[:, 1].min(), centre_img[:, 1].max()
+                clip = [b[(b[:, 1] >= lo) & (b[:, 1] <= hi)] for b in (left, right)]
+                if all(len(b) >= 2 for b in clip):
+                    ego_pair = tuple(clip)
+            else:
+                centre_img = None
+            geom = (
+                road_geometry(centre_img, ground, previews)
+                if (centre_img is not None and r.has_geometry) else None
+            )
+            smoothed = FilteredGeometry(
+                lateral_offset_m=r.lateral_offset_m,
+                heading_error_rad=r.heading_error_rad,
+                curvature_1pm=r.curvature_1pm,
+                measured=r.has_geometry,
+                accepted=r.has_geometry,
+                coasting_frames=r.coasting_frames,
+            )
+            detected += r.has_geometry
+            hist["offset_raw"].append(r.raw_lateral_offset_m if r.has_geometry else None)
+            hist["kappa_raw"].append(r.raw_curvature_1pm if r.has_geometry else None)
+            hist["offset_filt"].append(smoothed.lateral_offset_m)
+            hist["kappa_filt"].append(smoothed.curvature_1pm)
+            frame = _render(image, pred, polylines, centre_img, geom, ground, previews,
+                            smoothed, hist, ego_pair=ego_pair)
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            writer.write(bgr)
+            if frames_dir is not None:
+                cv2.imwrite(str(frames_dir / f"{n:04d}.png"), bgr)
+            n += 1
+            continue
         if tracker is not None:
             tracked = tracker.update(polylines)
             centre_img = tracker.centerline(tracked)

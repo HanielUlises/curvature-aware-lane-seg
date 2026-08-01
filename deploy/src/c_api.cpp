@@ -16,7 +16,7 @@
 #include "curvature_port/temporal.hpp"
 
 namespace {
-constexpr int32_t kAbiVersion = 1;
+constexpr int32_t kAbiVersion = 2;
 }
 
 // Holds every stage plus its scratch, so the per-frame call allocates nothing.
@@ -91,6 +91,9 @@ void cp_chain_process(cp_chain* chain, const uint8_t* mask, double speed_mps,
       off = rg.lateral_offset_m;
       head = rg.heading_error_rad;
       kap = rg.curvature_1pm;
+      out->raw_lateral_offset_m = off;
+      out->raw_heading_error_rad = head;
+      out->raw_curvature_1pm = kap;
       for (std::size_t i = 0; i < 3 && i < rg.preview_curvature_1pm.size(); ++i) {
         out->preview_curvature_1pm[i] = rg.preview_curvature_1pm[i];
       }

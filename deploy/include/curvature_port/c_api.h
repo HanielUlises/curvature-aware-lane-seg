@@ -34,6 +34,12 @@ typedef struct {
   double lateral_offset_m; /* filtered */
   double heading_error_rad;
   double curvature_1pm;
+  /* The same three before filtering. A supervisor wants both: the filtered signal is
+   * what steers, the raw one is what tells you whether the filter is coasting through
+   * noise or through nothing. Only meaningful when has_geometry is set. */
+  double raw_lateral_offset_m;
+  double raw_heading_error_rad;
+  double raw_curvature_1pm;
   double preview_curvature_1pm[3]; /* at 5, 10, 20 m; NaN outside the centreline */
   double steer_rad;                /* saturated command, right-positive */
   double steer_unsaturated_rad;
