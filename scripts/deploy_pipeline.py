@@ -1,17 +1,23 @@
-"""Inference and control on real footage, with the geometry running in C++.
+"""Inference and control on real footage, with the whole pipeline running in C++.
 
-The deployment shape of this project: a segmenter produces a mask, and everything after
-it — decomposition, tracking, projection, road geometry, filtering, the controller — runs
-in the C++ library that ships to the vehicle, reached through ``src.native``. Python is
-the harness, not the implementation.
+The deployment shape of this project: a camera frame goes in and a steering command
+comes out, and every stage between them — preprocessing, the network, decomposition,
+tracking, projection, road geometry, filtering, the controller — runs in the C++ library
+that ships to the vehicle, reached through ``src.native``. Python opens the file and
+prints the summary.
 
-Reports the split between the two costs, which is the number that matters when deciding
-what to optimize next. On this machine the network dominates the chain by roughly two
-orders of magnitude, so the geometry is not the bottleneck and further micro-optimizing it
-would be wasted effort; that only became obvious once both were measured together.
+That was not true until recently. The geometry ran in C++ while the network ran in
+PyTorch, so the "deployed" pipeline re-entered Python for the stage that costs most of
+the frame, and the reported latency left out the preprocessing entirely because the
+preprocessing happened before the clock started. Both are fixed here: the split below
+covers the whole frame, and it adds up.
 
     python -m scripts.deploy_pipeline infer.source=<clip-dir-or-video> \\
-        infer.ckpt=<checkpoint> ipm.calibration_file=<calibration.json>
+        [+onnx=<model.onnx>] [+backend=tensorrt] [ipm.calibration_file=<calibration.json>]
+
+The C++ tool next to it does the same thing with no Python at all:
+
+    deploy/build/run_infer --model <onnx> --source <clip> --calibration <json>
 """
 
 from __future__ import annotations
@@ -22,17 +28,12 @@ import math
 import time
 from pathlib import Path
 
+import cv2
 import hydra
-import numpy as np
-import torch
 from omegaconf import DictConfig
 
 from src import native
-from src.data.subset import read_manifest
-from src.data.transforms import build_eval_transform, preprocess_geometry
-from src.models.lane_segmenter import LaneSegmenter
-from scripts.infer_sequence import _center_crop_aspect, _frames_from_source
-from scripts.infer_video import _resolve_ckpt
+from scripts.infer_sequence import _frames_from_source
 
 
 def _percentile(values: list[float], p: float) -> float:
@@ -44,20 +45,21 @@ def _percentile(values: list[float], p: float) -> float:
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig) -> None:
-    if not native.available():
+    if not native.segmenter_available():
         raise RuntimeError(
-            f"the native chain is required by this script: {native.why_unavailable()}"
+            "this script needs the native pipeline: "
+            f"{native.why_unavailable() or 'rebuild with -DONNXRUNTIME_ROOT=<dir>'}"
         )
     if not cfg.infer.source:
         raise ValueError("set infer.source=<image-dir-or-video-file>")
 
     target = tuple(cfg.data.target_size)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    _, meta = read_manifest(Path(cfg.paths.output_root) / "manifests" / "val.json")
-    model = LaneSegmenter.load_from_checkpoint(
-        str(_resolve_ckpt(cfg)), bin_edges=meta["bin_edges"], map_location=device
-    ).eval().to(device)
-    transform = build_eval_transform()
+    out_root = Path(cfg.paths.output_root) / "export"
+    model_path = Path(cfg.get("onnx", out_root / "lane_segmenter.onnx"))
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"{model_path} does not exist; run scripts.export_onnx first"
+        )
 
     calibration = None
     calib_path = cfg.get("ipm", {}).get("calibration_file", None) or (
@@ -72,42 +74,41 @@ def main(cfg: DictConfig) -> None:
     else:
         print("no calibration: the metric outputs and the steering command are skipped")
 
-    chain = native.NativeChain(target[0], target[1], calibration)
+    pipeline = native.NativePipeline(
+        model_path, target[0], target[1], calibration,
+        backend=str(cfg.get("backend", "auto")),
+        engine_cache_dir=out_root / "trt_cache",
+        threshold=float(cfg.infer.get("threshold", 0.5)),
+        sky_frac=float(cfg.data.sky_frac),
+    )
     speed = float(cfg.infer.get("speed_mps", 15.0))
-    threshold = float(cfg.infer.get("threshold", 0.5))
 
     out_dir = Path(cfg.infer.out_dir) if cfg.infer.out_dir else Path("results/deploy")
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "chain.csv"
 
+    pre_us: list[float] = []
     net_us: list[float] = []
     chain_us: list[float] = []
+    total_us: list[float] = []
     detected = 0
     rows = []
 
     for index, rgb in enumerate(
         _frames_from_source(Path(cfg.infer.source), cfg.infer.get("max_frames", None))
     ):
-        rgb = _center_crop_aspect(rgb, target)
-        image = preprocess_geometry(rgb, target, cfg.data.sky_frac)
-        tensor = transform(image=image)["image"].unsqueeze(0).to(device)
-
+        # Handed over at native resolution: the crop, resize and normalization are part
+        # of the deployed path and are timed as part of it.
+        frame = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         t0 = time.perf_counter()
-        with torch.no_grad():
-            prob = torch.sigmoid(model(tensor))
-        if device == "cuda":
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        mask = np.ascontiguousarray(
-            (prob[0, 0].cpu().numpy() >= threshold).astype(np.uint8)
-        )
+        r = pipeline.process(frame, speed)
+        whole = (time.perf_counter() - t0) * 1e6
 
-        t2 = time.perf_counter()
-        r = chain.process_into(mask, speed)
-        t3 = time.perf_counter()
-
-        net_us.append((t1 - t0) * 1e6)
-        chain_us.append((t3 - t2) * 1e6)
+        t = pipeline.timings_us
+        pre_us.append(t["preprocess"])
+        net_us.append(t["network"])
+        chain_us.append(t["chain"])
+        total_us.append(whole)
         detected += 1 if r.has_centerline else 0
         rows.append({
             "frame": index,
@@ -118,9 +119,13 @@ def main(cfg: DictConfig) -> None:
             "steer_deg": round(math.degrees(r.steer_rad), 3),
             "saturated": int(r.saturated),
             "coasting": int(r.coasting_frames),
-            "net_us": round(net_us[-1], 1),
-            "chain_us": round(chain_us[-1], 1),
+            "preprocess_us": round(t["preprocess"], 1),
+            "network_us": round(t["network"], 1),
+            "chain_us": round(t["chain"], 1),
         })
+
+    if not rows:
+        raise RuntimeError(f"no frames read from {cfg.infer.source}")
 
     with csv_path.open("w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
@@ -128,18 +133,19 @@ def main(cfg: DictConfig) -> None:
         writer.writerows(rows)
 
     n = len(rows)
-    net_mean = sum(net_us) / n
-    chain_mean = sum(chain_us) / n
-    total = net_mean + chain_mean
-    print(f"\n{n} frames at {target[0]}x{target[1]} on {device}")
+    mean = lambda v: sum(v) / n  # noqa: E731
+    total = mean(total_us)
+    print(f"\n{n} frames at {target[0]}x{target[1]}, everything in C++")
     print(f"  ego lane on            {detected} frames ({100.0 * detected / n:.1f}%)")
-    print(f"  network                {net_mean:8.1f} us/frame  "
+    print(f"  preprocess             {mean(pre_us):8.1f} us/frame  "
+          f"(p95 {_percentile(pre_us, 95):.0f})")
+    print(f"  network                {mean(net_us):8.1f} us/frame  "
           f"(p95 {_percentile(net_us, 95):.0f})")
-    print(f"  geometry chain (C++)   {chain_mean:8.1f} us/frame  "
+    print(f"  geometry chain         {mean(chain_us):8.1f} us/frame  "
           f"(p95 {_percentile(chain_us, 95):.0f})")
-    print(f"  total                  {total:8.1f} us/frame  "
-          f"= {1e6 / total:.0f} fps")
-    print(f"  chain share of budget  {100.0 * chain_mean / total:.1f}%")
+    print(f"  whole frame            {total:8.1f} us/frame  "
+          f"(p95 {_percentile(total_us, 95):.0f}) = {1e6 / total:.0f} fps")
+    print(f"  chain share of budget  {100.0 * mean(chain_us) / total:.1f}%")
     print(f"\nwrote {csv_path}")
 
 
