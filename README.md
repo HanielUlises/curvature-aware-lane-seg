@@ -554,7 +554,7 @@ deploy/build/run_infer --model lane_segmenter.onnx --source <clip> \
     --calibration calibration.json --backend tensorrt --cache <dir>
 ```
 
-Measured over 400 frames of TuSimple, on a machine whose GPU is an RTX 3060:
+Measured over 400 frames of TuSimple:
 
 | stage | µs/frame | p95 | share |
 |---|---|---|---|
