@@ -493,12 +493,13 @@ better than it was and still not good enough to drive on.
 
 ## Deployment
 
-The chain that turns a mask into a steering command runs in C++. Python drives it through
-a C ABI rather than carrying a second implementation, so the code that runs in a notebook
-is the code that would run on the vehicle. The pure-Python stages remain as the reference
-the golden fixtures are generated from and the port is checked against, which is a test
-role rather than a runtime one: with nothing behind the wrapper, the fixtures would be
-comparing the port against itself.
+Everything between a camera frame and a steering command runs in C++ — the preprocessing,
+the network, and the whole geometry chain. Python drives it through a C ABI rather than
+carrying a second implementation, so the code that runs in a notebook is the code that
+would run on the vehicle. The pure-Python stages remain as the reference the golden
+fixtures are generated from and the port is checked against, which is a test role rather
+than a runtime one: with nothing behind the wrapper, the fixtures would be comparing the
+port against itself.
 
 <p align="center">
   <img src="docs/assets/kitti_native_demo.gif" alt="The C++ chain running on KITTI" width="760">
@@ -531,58 +532,153 @@ was not what the effort so far suggested:
 | segmenter, PyTorch fp32 | 8,263 | 97.7% |
 | geometry chain (C++) | 191 | **2.3%** |
 
-At that point further work on the geometry would have been wasted, so the segmenter was exported to ONNX
-(opset 17, 57 MB) and every runtime that could consume it was measured.
-`scripts/export_onnx.py` does both. Parity is checked before any timing, on the
-**thresholded mask** the chain consumes rather than on logits, because a faster runtime
-that produces a different mask is not faster.
+At that point further work on the geometry would have been wasted, so the segmenter was
+exported to ONNX (opset 17, 57 MB) and handed to TensorRT.
 
-| runtime | mean µs | p95 µs | fps | vs PyTorch | mask agreement |
+### Moving the network into C++ as well
+
+The table above has a hole in it, and the hole is the interesting part. The geometry ran
+in C++ and the network ran in PyTorch, so the "deployed" pipeline left the process for
+the stage that cost 98% of the frame — and the preprocessing in front of the network was
+not in the table at all, because it happened before the clock started. What was being
+reported as a deployment was a Python program with a fast subroutine in it.
+
+So the session moved too. `deploy/src/segmenter.cpp` opens the ONNX graph through ONNX
+Runtime's C++ API, selects an execution provider, and does the crop, resize and
+normalization itself; `cp_pipeline_process` puts it in front of the existing chain. A
+frame now goes in at native resolution and a steering command comes out without leaving
+C++:
+
+```
+deploy/build/run_infer --model lane_segmenter.onnx --source <clip> \
+    --calibration calibration.json --backend tensorrt --cache <dir>
+```
+
+Measured over 400 frames of TuSimple, on a machine whose GPU is an RTX 3060:
+
+| stage | µs/frame | p95 | share |
+|---|---|---|---|
+| preprocess (crop, resize, normalize) | 2,145 | 3,256 | 46.3% |
+| network (TensorRT fp16) | 2,266 | 2,395 | 48.9% |
+| geometry chain | 165 | 230 | **3.6%** |
+| **whole frame** | **4,633** | 5,694 | **216 fps** |
+
+The same 400 frames through the previous Python-driven path took 7,161 µs of *counted*
+time at 140 fps — 1.55× slower than the C++ path on counted time alone. But that number
+excluded the preprocessing it was also paying for, and the same `INTER_AREA` resize
+measures about 1.6 ms through Python's OpenCV, so the honest end-to-end comparison is
+closer to **2×**.
+
+The result that actually changed a decision, though, is the first row. Preprocessing is
+now the largest stage in the frame — larger than the network TensorRT was brought in to
+accelerate. Almost all of it is one `INTER_AREA` resize, which is roughly eight times the
+cost of `INTER_LINEAR` here. It stays anyway: the crop is aspect-preserving so the resize
+is isotropic and curvature survives it, and the model was trained under `INTER_AREA`, so
+swapping it would be a train/test mismatch traded for latency the frame budget does not
+need. Somewhere worth optimizing next, and the place to do it is the GPU, not a
+hand-rolled resampler.
+
+### Choosing a provider, measured where the code runs
+
+`bench_backends` replaces what used to be a Python benchmark. That script measured
+onnxruntime through its Python bindings and compared it against a PyTorch baseline the
+deployed path does not contain, which answers a question nobody deploying has. The
+question that matters is narrower: given this ONNX file, which provider should the
+vehicle's process open a session with.
+
+| backend | total µs | network | preprocess | fps | mask agreement |
 |---|---|---|---|---|---|
-| **ONNX Runtime, TensorRT fp16** | **1,779** | 1,837 | **562** | **3.65×** | 99.9871% |
-| PyTorch fp16 | 4,539 | 4,967 | 220 | 1.43× | 99.9986% |
-| PyTorch fp32 | 6,494 | 7,333 | 154 | 1.00× | — |
-| ONNX Runtime, CUDA | 8,052 | 9,012 | 124 | 0.81× | 99.9939% |
-| ONNX Runtime, CPU | 2,210,015 | — | 0 | 0.003× | 100.0000% |
+| **TensorRT fp16** | **4,085** | **1,837** | 2,195 | **245** | 99.9864% |
+| TensorRT fp32 | 6,318 | 4,155 | 2,101 | 158 | 99.9980% |
+| CUDA | 9,161 | 6,692 | 2,407 | 109 | 99.9925% |
+| CPU | 1,975,664 | 1,972,542 | 3,071 | 1 | reference |
 
-**TensorRT is worth 3.65×; the ONNX file on its own is worth nothing.** Handing the same
-graph to ONNX Runtime's CUDA provider is 19% *slower* than PyTorch, so the gain is not
-"exporting to ONNX" but the kernel fusion and fp16 engine that TensorRT builds from it: a
-U-Net is mostly conv/BN/ReLU chains, which is exactly what there is to fuse. Half
-precision alone, needing no export at all, gets 1.43× and is the sensible fallback
-wherever TensorRT cannot be installed.
+TensorRT's fp16 engine runs the network **3.6× faster than ONNX Runtime's CUDA
+provider**, which is itself no faster than PyTorch was. The gain is not "exporting to
+ONNX" — it is the kernel fusion and the half-precision engine TensorRT builds from the
+export, and a U-Net is mostly conv/BN/ReLU chains, which is exactly what there is to fuse.
+Agreement is measured against the CPU provider, which has no fp16 engine and no fused
+kernels between it and the graph, so it is the row with nothing to be wrong about.
 
-The mask agreement column is what makes those numbers usable. The TensorRT engine
-disagrees with fp32 on 0.013% of pixels and fp16 on 0.0014%, both far below the frame-to-
-frame variation the tracker already absorbs.
+Two failure modes are worth recording, because both produce a wrong answer rather than an
+error.
 
-With the fast engine the budget looks different, and the geometry chain stops being
-negligible:
+**The provider that silently is not there.** onnxruntime's Python path swallows a
+provider that fails to load and only warns, so an early run of the old benchmark reported
+a two-second CPU timing under the heading "TensorRT fp16". The C++ API surfaces it as an
+exception where it happens, so the mislabelled number cannot be produced; `auto` simply
+falls through to the next backend. What is deliberately *not* enforced is that every node
+landed on the accelerator — ONNX Runtime keeps shape ops on the CPU because they are
+faster there, and demanding otherwise rejects a session that is working correctly.
 
-| | µs/frame | share |
-|---|---|---|
-| segmenter, TensorRT fp16 | 1,779 | 90.3% |
-| geometry chain (C++) | 191 | **9.7%** |
-| total | 1,970 | 508 fps |
+**The engine built from the previous weights.** TensorRT engines are cached under a name
+derived from the *graph*, and two checkpoints of the same architecture have the same
+graph. Re-export from a different checkpoint into the same path, point at the same cache,
+and TensorRT loads the old engine: same topology, previous weights, no error, no warning.
+This happened here. It cost an afternoon and it presented as an fp16 accuracy problem —
+lane-class IoU against the reference sat at 0.64 while fp32 was at 0.997, which is exactly
+what a precision problem looks like. The engine cache is now a subdirectory named for a
+hash of the model file's contents, so different weights cannot share a cache entry.
 
-At 2.3% the chain was not worth optimizing; at 9.7% the C++ port is what keeps the total
-near 500 fps, and a Python chain would now cost more than the network.
+### Does the deployed path see the same road?
 
-Two practical notes, since this took three attempts to get running. The TensorRT provider
-must match the major version onnxruntime was built against, and pip's newest wheel is not
-it: onnxruntime 1.23 needed TensorRT 10.x, while `pip install tensorrt` gave 11.2, which
-loads and then fails to register. Its libraries also have to be on `LD_LIBRARY_PATH`:
+The geometry port has golden vectors and the chain is checked against the Python
+reference to 1.3e-11. The join between the two — C++ preprocessing plus the ONNX graph
+against Python preprocessing plus PyTorch — is checked by `scripts/check_native_parity.py`
+over the mask the chain actually consumes:
+
+| deployed path | mask agreement | lane-class IoU | differing pixels |
+|---|---|---|---|
+| ONNX + CUDA (fp32) | 99.9948% | 0.99923 | 8 of 147,456 |
+| ONNX + TensorRT (fp16) | 99.9815% | 0.99726 | 27 of 147,456 |
+
+And end to end, running the whole 400-frame clip through both pipelines and comparing the
+steering geometry frame by frame:
+
+| deployed path | detection agrees | offset mean | p95 | max | frames > 0.5 m |
+|---|---|---|---|---|---|
+| CUDA (fp32) | 100.00% | 0.003 m | 0.014 | 0.07 | 0 / 400 |
+| TensorRT (fp16) | 99.75% | 0.135 m | 0.753 | 3.61 | 32 / 400 |
+
+fp32 reproduces the reference pipeline to within 7 cm at worst, which is the real result:
+the C++ preprocessing, the export and the chain together are the same pipeline.
+
+The fp16 row is the trade-off, and it is worth being precise about what it costs. The
+chain is deterministic given a mask, so the divergence is not drift — it is that 27
+different pixels occasionally flip which component the tracker associates as an ego
+boundary, and the tracker is stateful, so the two histories then differ for a few frames
+before re-converging. It is bursty rather than gradual: 368 of 400 frames agree within
+0.5 m, and the excursions are short runs after a marginal frame. Whether the 2.3× that
+fp16 buys over the fp32 engine (1,837 µs against 4,155) is worth that is a decision for
+whoever is holding the wheel, which is why both are selectable at run time and both sets
+of numbers are here.
+
+### Building it
+
+The segmenter is optional. `curvature_port` is a few hundred kilobytes and needs nothing
+but Eigen, which is what makes it plausible on a vehicle ECU; ONNX Runtime and OpenCV are
+neither small nor always available, so the network stage is a separate target and
+everything else still builds without them.
+
+```
+cmake -S deploy -B deploy/build -DONNXRUNTIME_ROOT=<unpacked onnxruntime release>
+cmake --build deploy/build -j
+cd deploy/build && ctest
+```
+
+Without `ONNXRUNTIME_ROOT` the geometry chain, its five golden test suites and `run_chain`
+build as before, and `cp_segmenter_available()` returns 0 so a caller finds out at run
+time rather than from the dynamic linker.
+
+TensorRT's libraries have to be on `LD_LIBRARY_PATH`, and its major version must match
+what onnxruntime was built against — onnxruntime 1.23 needs TensorRT 10.x, while
+`pip install tensorrt` gives 11.2, which loads and then fails to register:
 
 ```
 TRT_LIBS=$(python -c "import tensorrt_libs,os;print(os.path.dirname(tensorrt_libs.__file__))")
-LD_LIBRARY_PATH="$TRT_LIBS:$LD_LIBRARY_PATH" python -m scripts.export_onnx
+LD_LIBRARY_PATH="$TRT_LIBS:$LD_LIBRARY_PATH" deploy/build/run_infer --model ...
 ```
 
-And when the provider fails, onnxruntime falls back to CPU and only warns. An early run of
-this benchmark duly reported a two-second CPU timing under the heading "TensorRT fp16",
-which is how a table like the one above ends up quietly wrong. The script now verifies the
-session actually got the provider it asked for and skips it otherwise, on the grounds that
-a missing row is better than a mislabelled one.
 
 ## Roadmap toward the controller
 
